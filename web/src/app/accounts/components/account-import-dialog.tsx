@@ -379,7 +379,42 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     }
 
     if (method === "csv") {
-      return null;
+      return (
+        <div className="space-y-4">
+          <button
+            type="button"
+            onClick={() => setMethod("menu")}
+            className="inline-flex items-center gap-1 text-sm text-stone-500 transition hover:text-stone-800"
+          >
+            <ArrowLeft className="size-4" />
+            返回导入方式
+          </button>
+          <div className="rounded-2xl border border-dashed border-stone-200 bg-stone-50 p-5">
+            <div className="space-y-2">
+              <div className="text-sm font-medium text-stone-800">选择 CSV 文件</div>
+              <div className="text-sm leading-6 text-stone-500">
+                支持「导出账号信息」生成的 CSV 文件，需包含 access_token 列。
+              </div>
+            </div>
+            <Button
+              type="button"
+              className="mt-4 rounded-xl bg-stone-950 text-white hover:bg-stone-800"
+              onClick={() => csvInputRef.current?.click()}
+              disabled={isSubmitting}
+            >
+              <FileSpreadsheet className="size-4" />
+              选择 CSV 文件
+            </Button>
+          </div>
+          <input
+            ref={csvInputRef}
+            type="file"
+            accept=".csv,text/csv"
+            className="hidden"
+            onChange={(event) => void handleCsvSelected(event)}
+          />
+        </div>
+      );
     }
 
     if (method === "cpa") {
@@ -452,10 +487,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
           title="导入 CSV 文件"
           description="导入「导出账号信息」生成的 CSV 文件（含邮箱、密码、token 等）。"
           icon={FileSpreadsheet}
-          onClick={() => {
-            setMethod("csv");
-            requestAnimationFrame(() => csvInputRef.current?.click());
-          }}
+          onClick={() => setMethod("csv")}
         />
         <MethodCard
           title="从远程 CPA 服务器导入"
