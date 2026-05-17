@@ -1,7 +1,7 @@
 import { httpRequest, request } from "@/lib/request";
 
 export type AccountType = string;
-export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
+export type AccountStatus = "正常" | "限流" | "异常" | "过期" | "禁用";
 export type ImageModel = "gpt-image-2" | "codex-gpt-image-2";
 export type AuthRole = "admin" | "user";
 
@@ -12,6 +12,9 @@ export type Account = {
   quota: number;
   image_quota_unknown?: boolean;
   email?: string | null;
+  password?: string;
+  refresh_token?: string;
+  refresh_token_expires_at?: number | null;
   user_id?: string | null;
   limits_progress?: Array<{
     feature_name?: string;
@@ -20,9 +23,12 @@ export type Account = {
   }>;
   default_model_slug?: string | null;
   restore_at?: string | null;
+  created_at?: string | null;
   success: number;
   fail: number;
   last_used_at?: string | null;
+  expires_at?: number | null;
+  last_refreshed_at?: number | null;
 };
 
 type AccountListResponse = {
@@ -261,6 +267,13 @@ export async function createAccounts(tokens: string[]) {
   });
 }
 
+export async function importAccounts(csvContent: string) {
+  return httpRequest<AccountMutationResponse>("/api/accounts/import", {
+    method: "POST",
+    body: { tokens: [csvContent] },
+  });
+}
+
 export async function deleteAccounts(tokens: string[]) {
   return httpRequest<AccountMutationResponse>("/api/accounts", {
     method: "DELETE",
@@ -272,6 +285,34 @@ export async function refreshAccounts(accessTokens: string[]) {
   return httpRequest<AccountRefreshResponse>("/api/accounts/refresh", {
     method: "POST",
     body: { access_tokens: accessTokens },
+  });
+}
+
+export async function exportAccounts(format: "csv" | "json" = "csv") {
+  const params = new URLSearchParams({ format });
+  const response = await request.get(`/api/accounts/export?${params.toString()}`, { responseType: "blob" });
+  const blob = response.data as Blob;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = format === "csv" ? "accounts-export.csv" : "accounts-export.json";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+export type ReloginResponse = {
+  items?: Account[];
+  otp_sent?: boolean;
+  session_id?: string;
+  email?: string;
+};
+
+export async function reloginAccount(accessToken: string, code?: string, sessionId?: string) {
+  return httpRequest<ReloginResponse>("/api/accounts/relogin", {
+    method: "POST",
+    body: { access_token: accessToken, code: code || "", session_id: sessionId || "" },
   });
 }
 

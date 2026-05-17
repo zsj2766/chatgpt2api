@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import json
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Condition, Lock
 from typing import Any
@@ -40,11 +43,23 @@ class AccountService:
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):
             return False
-        if account.get("status") in {"禁用", "限流", "异常"}:
+        if account.get("status") in {"禁用", "限流", "异常", "过期"}:
             return False
         if bool(account.get("image_quota_unknown")):
             return True
         return int(account.get("quota") or 0) > 0
+
+    @staticmethod
+    def _decode_jwt_exp(token: str) -> int:
+        try:
+            payload = token.split(".")[1]
+            padding = 4 - len(payload) % 4
+            if padding != 4:
+                payload += "=" * padding
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            return int(claims.get("exp") or 0)
+        except Exception:
+            return 0
 
     def _normalize_account(self, item: dict) -> dict | None:
         if not isinstance(item, dict):
@@ -67,6 +82,27 @@ class AccountService:
         normalized["success"] = int(normalized.get("success") or 0)
         normalized["fail"] = int(normalized.get("fail") or 0)
         normalized["last_used_at"] = normalized.get("last_used_at")
+        normalized["refresh_token"] = normalized.get("refresh_token") or ""
+        normalized["password"] = normalized.get("password") or ""
+        normalized["created_at"] = normalized.get("created_at") or None
+        last_refreshed_at = normalized.get("last_refreshed_at")
+        normalized["last_refreshed_at"] = int(last_refreshed_at) if last_refreshed_at else None
+        expires_at = normalized.get("expires_at")
+        if expires_at is not None:
+            try:
+                normalized["expires_at"] = int(expires_at)
+            except (TypeError, ValueError):
+                normalized["expires_at"] = None
+        else:
+            normalized["expires_at"] = None
+        refresh_token_expires_at = normalized.get("refresh_token_expires_at")
+        if refresh_token_expires_at is not None:
+            try:
+                normalized["refresh_token_expires_at"] = int(refresh_token_expires_at)
+            except (TypeError, ValueError):
+                normalized["refresh_token_expires_at"] = None
+        else:
+            normalized["refresh_token_expires_at"] = None
         return normalized
 
     def list_tokens(self) -> list[str]:
@@ -135,7 +171,7 @@ class AccountService:
             candidates = [
                 token
                 for account in self._accounts.values()
-                if account.get("status") not in {"禁用", "异常"}
+                if account.get("status") not in {"禁用", "异常", "过期"}
                    and (token := account.get("access_token") or "")
                    and token not in excluded
             ]
@@ -161,16 +197,10 @@ class AccountService:
             self._save_accounts()
 
     def remove_invalid_token(self, access_token: str, event: str) -> bool:
-        if not config.auto_remove_invalid_accounts:
-            self.update_account(access_token, {"status": "异常", "quota": 0})
-            return False
-        removed = bool(self.delete_accounts([access_token])["removed"])
-        if removed:
-            log_service.add(LOG_TYPE_ACCOUNT, "自动移除异常账号",
-                            {"source": event, "token": anonymize_token(access_token)})
-        elif access_token:
-            self.update_account(access_token, {"status": "异常", "quota": 0})
-        return removed
+        self.update_account(access_token, {"status": "异常", "quota": 0})
+        log_service.add(LOG_TYPE_ACCOUNT, "账号标记异常",
+                        {"source": event, "token": anonymize_token(access_token)})
+        return False
 
     def get_account(self, access_token: str) -> dict | None:
         if not access_token:
@@ -192,26 +222,54 @@ class AccountService:
                    and (token := item.get("access_token") or "")
             ]
 
-    def add_accounts(self, tokens: list[str]) -> dict:
-        tokens = list(dict.fromkeys(token for token in tokens if token))
-        if not tokens:
+    def add_accounts(self, tokens: list) -> dict:
+        filtered: list = []
+        seen: set[str] = set()
+        for token in tokens:
+            if not token:
+                continue
+            if isinstance(token, dict):
+                key = str(token.get("access_token") or "").strip()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                filtered.append(token)
+            else:
+                key = str(token or "").strip()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                filtered.append(key)
+        if not filtered:
             return {"added": 0, "skipped": 0, "items": self.list_accounts()}
 
         with self._lock:
             added = 0
             skipped = 0
-            for access_token in tokens:
+            for item in filtered:
+                if isinstance(item, dict):
+                    access_token = str(item.get("access_token") or "").strip()
+                    if not access_token:
+                        continue
+                else:
+                    access_token = str(item or "").strip()
+                    item = {}
                 current = self._accounts.get(access_token)
-                if current is None:
+                is_new = current is None
+                if is_new:
                     added += 1
                     current = {}
+                    expires_at = self._decode_jwt_exp(access_token) or None
                 else:
                     skipped += 1
+                    expires_at = current.get("expires_at")
                 account = self._normalize_account(
                     {
                         **current,
+                        **({k: v for k, v in item.items() if k != "access_token"} if isinstance(item, dict) else {}),
                         "access_token": access_token,
-                        "type": str(current.get("type") or "free"),
+                        "type": str(current.get("type") or item.get("type") or "free"),
+                        "expires_at": expires_at,
                     }
                 )
                 if account is not None:
@@ -262,6 +320,33 @@ class AccountService:
             return dict(account)
         return None
 
+    def replace_token(self, old_token: str, new_token: str, updates: dict | None = None) -> dict | None:
+        """Replace an account's access_token key and apply updates (used for token rotation)."""
+        if not old_token or not new_token or old_token == new_token:
+            if old_token and updates:
+                return self.update_account(old_token, updates)
+            return None
+        with self._lock:
+            current = self._accounts.pop(old_token, None)
+            self._image_inflight.pop(old_token, None)
+            if current is None:
+                return None
+            merged = dict(current)
+            merged["access_token"] = new_token
+            if updates:
+                merged.update(updates)
+            expires_at = self._decode_jwt_exp(new_token) or None
+            merged["expires_at"] = expires_at
+            normalized = self._normalize_account(merged)
+            if normalized is None:
+                return None
+            self._accounts[new_token] = normalized
+            self._save_accounts()
+            log_service.add(LOG_TYPE_ACCOUNT, "token 已替换",
+                            {"old": anonymize_token(old_token), "new": anonymize_token(new_token),
+                             "email": normalized.get("email")})
+            return dict(normalized)
+
     def mark_image_result(self, access_token: str, success: bool) -> dict | None:
         if not access_token:
             return None
@@ -307,6 +392,7 @@ class AccountService:
         except InvalidAccessTokenError:
             self.remove_invalid_token(access_token, event)
             raise
+        result["last_refreshed_at"] = time.time()
         return self.update_account(access_token, result)
 
     def refresh_accounts(self, access_tokens: list[str]) -> dict[str, Any]:
@@ -337,6 +423,90 @@ class AccountService:
             "errors": errors,
             "items": self.list_accounts(),
         }
+
+    def refresh_access_token(self, account: dict) -> dict | None:
+        """Use refresh_token to obtain a new access_token and update storage."""
+        refresh_token = str(account.get("refresh_token") or "").strip()
+        access_token = str(account.get("access_token") or "").strip()
+        if not refresh_token or not access_token:
+            return None
+
+        import requests
+
+        proxy = config.get_proxy_settings()
+        session = requests.Session()
+        session.verify = False
+        if proxy:
+            session.proxies.update({"http": proxy, "https": proxy})
+
+        status_code = None
+        data: dict = {}
+        try:
+            resp = session.post(
+                "https://auth.openai.com/oauth/token",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": "app_2SKx67EdpoN0G6j4rFvigXD",
+                    "redirect_uri": "https://platform.openai.com/auth/callback",
+                },
+                timeout=30,
+            )
+            status_code = resp.status_code
+            try:
+                body = resp.json()
+                data = body if isinstance(body, dict) else {}
+            except Exception:
+                data = {}
+        except Exception as exc:
+            log_service.add(LOG_TYPE_ACCOUNT, "refresh_token 请求失败",
+                            {"token": anonymize_token(access_token), "error": str(exc)})
+            return None
+
+        if status_code != 200 or not data.get("access_token"):
+            if status_code in (400, 401):
+                log_service.add(LOG_TYPE_ACCOUNT, "refresh_token 已失效",
+                                {"token": anonymize_token(access_token), "status": status_code})
+                with self._lock:
+                    current = self._accounts.get(access_token)
+                    if current is not None:
+                        current["status"] = "过期"
+                        self._save_accounts()
+            return None
+
+        new_access_token = str(data.get("access_token") or "").strip()
+        new_refresh_token = str(data.get("refresh_token") or "").strip()
+
+        with self._lock:
+            current = self._accounts.get(access_token)
+            if current is None:
+                return None
+            updated = dict(current)
+            updated["access_token"] = new_access_token
+            updated["refresh_token"] = new_refresh_token or refresh_token
+            if current.get("status") in {"异常", "过期"}:
+                updated["status"] = "正常"
+            updated["last_refreshed_at"] = time.time()
+            new_expires_at = self._decode_jwt_exp(new_access_token) or None
+            updated["expires_at"] = new_expires_at
+            rt_expires_in = data.get("refresh_token_expires_in")
+            if rt_expires_in is not None:
+                try:
+                    updated["refresh_token_expires_at"] = int(time.time()) + int(rt_expires_in)
+                except (TypeError, ValueError):
+                    pass
+            normalized = self._normalize_account(updated)
+            if normalized is None:
+                return None
+            self._accounts.pop(access_token, None)
+            self._image_inflight.pop(access_token, None)
+            self._accounts[new_access_token] = normalized
+            self._save_accounts()
+            log_service.add(LOG_TYPE_ACCOUNT, "access_token 已刷新",
+                            {"old": anonymize_token(access_token), "new": anonymize_token(new_access_token),
+                             "email": normalized.get("email")})
+            return dict(normalized)
 
 
 account_service = AccountService(config.get_storage_backend())

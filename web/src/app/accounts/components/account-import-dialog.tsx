@@ -12,6 +12,7 @@ import {
   LoaderCircle,
   ServerCog,
   Upload,
+  FileSpreadsheet,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -26,10 +27,10 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
-import { createAccounts, type Account } from "@/lib/api";
+import { createAccounts, importAccounts, type Account } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-type ImportMethod = "menu" | "token" | "session" | "cpa";
+type ImportMethod = "menu" | "token" | "session" | "cpa" | "csv";
 
 type AccountImportDialogProps = {
   disabled?: boolean;
@@ -114,6 +115,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
 
   const txtInputRef = useRef<HTMLInputElement | null>(null);
   const cpaInputRef = useRef<HTMLInputElement | null>(null);
+  const csvInputRef = useRef<HTMLInputElement | null>(null);
 
   const resetState = () => {
     setMethod("menu");
@@ -192,6 +194,25 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
     } catch (error) {
       const message = error instanceof Error ? error.message : "读取 TXT 文件失败";
       toast.error(message);
+    }
+  };
+
+  const handleCsvSelected = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const content = await readFileAsText(file);
+      setIsSubmitting(true);
+      const data = await importAccounts(content);
+      onImported(data.items);
+      setOpen(false);
+      resetState();
+      toast.success("CSV 导入完成，新增 " + (data.added ?? 0) + " 个，跳过 " + (data.skipped ?? 0) + " 个");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "CSV 导入失败");
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -357,6 +378,10 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       );
     }
 
+    if (method === "csv") {
+      return null;
+    }
+
     if (method === "cpa") {
       return (
         <div className="space-y-4">
@@ -424,6 +449,15 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
           onClick={() => setMethod("cpa")}
         />
         <MethodCard
+          title="导入 CSV 文件"
+          description="导入「导出账号信息」生成的 CSV 文件（含邮箱、密码、token 等）。"
+          icon={FileSpreadsheet}
+          onClick={() => {
+            setMethod("csv");
+            requestAnimationFrame(() => csvInputRef.current?.click());
+          }}
+        />
+        <MethodCard
           title="从远程 CPA 服务器导入"
           description="前往设置页面配置远程 CPA 服务器后再执行导入。"
           icon={Files}
@@ -469,7 +503,9 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                   ? "导入 Access Token"
                   : method === "session"
                     ? "导入 Session JSON"
-                    : "导入 CPA JSON"}
+                    : method === "csv"
+                      ? "导入 CSV 文件"
+                      : "导入 CPA JSON"}
             </DialogTitle>
             <DialogDescription className="text-sm leading-6">
               {method === "menu"
@@ -478,7 +514,9 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                   ? "支持手动粘贴或从 TXT 文件导入，一行一个 Token。"
                   : method === "session"
                     ? "粘贴完整 Session JSON，系统会自动提取 accessToken。"
-                    : "支持一次读取多个本地 JSON 文件，并在提交前做数量确认。"}
+                    : method === "csv"
+                      ? "导入「导出账号信息」按钮生成的 CSV 文件。"
+                      : "支持一次读取多个本地 JSON 文件，并在提交前做数量确认。"}
             </DialogDescription>
           </DialogHeader>
 

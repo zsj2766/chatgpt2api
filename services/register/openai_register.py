@@ -21,6 +21,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from services.account_service import account_service
+from services.log_service import LOG_TYPE_ACCOUNT, log_service
 from services.register import mail_provider
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -346,8 +347,10 @@ def extract_oauth_callback_params_from_consent_session(session: requests.Session
     if consent_url.startswith("/"):
         consent_url = f"{auth_base}{consent_url}"
     current_url = consent_url
+    redirect_chain: list[str] = []
     for _ in range(10):
         response = session.get(current_url, headers=navigate_headers, verify=False, timeout=30, allow_redirects=False)
+        redirect_chain.append(f"{current_url[:80]} → {response.status_code}")
         callback_params = extract_oauth_callback_params_from_url(str(response.url)) or extract_oauth_callback_params_from_url(str(response.headers.get("Location") or "").strip())
         if callback_params:
             return callback_params
@@ -357,6 +360,8 @@ def extract_oauth_callback_params_from_consent_session(session: requests.Session
         current_url = f"{auth_base}{location}" if location.startswith("/") else location
     raw = session.cookies.get("oai-client-auth-session", domain=".auth.openai.com") or session.cookies.get("oai-client-auth-session")
     if not raw:
+        log_service.add(LOG_TYPE_ACCOUNT, "OAuth 回调提取失败：缺少 oai-client-auth-session cookie",
+                        {"redirect_chain": redirect_chain})
         return None
     try:
         first_part = raw.split(".")[0]
@@ -365,7 +370,9 @@ def extract_oauth_callback_params_from_consent_session(session: requests.Session
             first_part += "=" * padding
         payload = json.loads(base64.urlsafe_b64decode(first_part))
         workspace_id = payload["workspaces"][0]["id"]
-    except Exception:
+    except Exception as exc:
+        log_service.add(LOG_TYPE_ACCOUNT, "OAuth 回调提取失败：cookie JWT 解析失败",
+                        {"error": str(exc)[:200]})
         return None
     headers = dict(common_headers)
     headers["referer"] = consent_url
@@ -378,10 +385,14 @@ def extract_oauth_callback_params_from_consent_session(session: requests.Session
     ws_data = _response_json(ws_resp)
     orgs = ((ws_data.get("data") or {}).get("orgs") or []) if isinstance(ws_data, dict) else []
     if not orgs:
+        log_service.add(LOG_TYPE_ACCOUNT, "OAuth 回调提取失败：workspace/select 返回无 orgs",
+                        {"status": ws_resp.status_code, "body": json.dumps(ws_data, ensure_ascii=False)[:300]})
         return None
     org_id = str((orgs[0] or {}).get("id") or "").strip()
     project_id = str(((orgs[0] or {}).get("projects") or [{}])[0].get("id") or "").strip()
     if not org_id:
+        log_service.add(LOG_TYPE_ACCOUNT, "OAuth 回调提取失败：orgs 数据缺少 id",
+                        {"orgs": json.dumps(orgs, ensure_ascii=False)[:300]})
         return None
     org_headers = dict(common_headers)
     org_headers["referer"] = str(ws_data.get("continue_url") or consent_url)
@@ -391,15 +402,22 @@ def extract_oauth_callback_params_from_consent_session(session: requests.Session
     if project_id:
         body["project_id"] = project_id
     org_resp = session.post(f"{auth_base}/api/accounts/organization/select", json=body, headers=org_headers, verify=False, timeout=30, allow_redirects=False)
-    return extract_oauth_callback_params_from_url(str(org_resp.headers.get("Location") or "").strip())
+    result = extract_oauth_callback_params_from_url(str(org_resp.headers.get("Location") or "").strip())
+    if not result:
+        log_service.add(LOG_TYPE_ACCOUNT, "OAuth 回调提取失败：organization/select 返回无 callback",
+                        {"status": org_resp.status_code, "location": str(org_resp.headers.get("Location") or "")[:200]})
+    return result
 
 
 def exchange_platform_tokens(session: requests.Session, device_id: str, code_verifier: str, consent_url: str) -> dict | None:
     callback_params = extract_oauth_callback_params_from_consent_session(session, consent_url, device_id)
     if not callback_params:
+        log_service.add(LOG_TYPE_ACCOUNT, "重登 token 换取失败：无法提取 OAuth 回调参数",
+                        {"consent_url": consent_url[:120]})
         return None
     code = str(callback_params.get("code") or "").strip()
     if not code:
+        log_service.add(LOG_TYPE_ACCOUNT, "重登 token 换取失败：回调参数中缺少 code")
         return None
     resp = create_session(config["proxy"]).post(
         f"{auth_base}/oauth/token",
@@ -416,14 +434,248 @@ def exchange_platform_tokens(session: requests.Session, device_id: str, code_ver
     )
     data = _response_json(resp)
     if resp.status_code != 200 or not data.get("access_token") or not data.get("refresh_token") or not data.get("id_token"):
+        log_service.add(LOG_TYPE_ACCOUNT, "重登 token 换取失败：/oauth/token 返回异常",
+                        {"status": resp.status_code, "body": json.dumps(data, ensure_ascii=False)[:300]})
         return None
     payload = _decode_jwt_payload(str(data.get("id_token") or "")) or _decode_jwt_payload(str(data.get("access_token") or ""))
+    refresh_token_expires_at = None
+    rt_expires_in = data.get("refresh_token_expires_in")
+    if rt_expires_in is not None:
+        try:
+            refresh_token_expires_at = int(time.time()) + int(rt_expires_in)
+        except (TypeError, ValueError):
+            pass
+    # Fallback: try to decode refresh_token as JWT to extract exp
+    if refresh_token_expires_at is None:
+        rt_payload = _decode_jwt_payload(str(data.get("refresh_token") or ""))
+        rt_exp = rt_payload.get("exp")
+        if rt_exp:
+            try:
+                refresh_token_expires_at = int(rt_exp)
+            except (TypeError, ValueError):
+                pass
+    # Default to 30 days if no expiry source
+    if refresh_token_expires_at is None:
+        refresh_token_expires_at = int(time.time()) + 86400 * 30
+    log_service.add(LOG_TYPE_ACCOUNT, "OAuth token 交换成功",
+                    {"email": str(payload.get("email") or "")[:100],
+                     "keys": sorted(data.keys()),
+                     "rt_expires_in": rt_expires_in,
+                     "rt_expires_at": refresh_token_expires_at})
     return {
         "email": str(payload.get("email") or "").strip(),
         "access_token": str(data.get("access_token") or "").strip(),
         "refresh_token": str(data.get("refresh_token") or "").strip(),
         "id_token": str(data.get("id_token") or "").strip(),
+        "refresh_token_expires_at": refresh_token_expires_at,
     }
+
+
+def relogin_and_get_tokens(proxy: str, email: str, password: str) -> dict:
+    """Standalone login to get fresh OAuth tokens for an existing account.
+
+    Returns normal token dict on success, or `{"otp_required": True, "session_id": str}`
+    when password verify succeeded but requires email OTP (session is stored for later validation).
+    Raises RuntimeError on actual failures.
+    """
+    log_service.add(LOG_TYPE_ACCOUNT, f"重登开始（密码模式）", {"email": email})
+    session = create_session(proxy)
+    device_id = str(uuid.uuid4())
+    session.cookies.set("oai-did", device_id, domain=".auth.openai.com")
+    session.cookies.set("oai-did", device_id, domain="auth.openai.com")
+    _keep_session = False
+    try:
+        code_verifier, code_challenge = _generate_pkce()
+        params = {
+            "issuer": auth_base,
+            "client_id": platform_oauth_client_id,
+            "audience": platform_oauth_audience,
+            "redirect_uri": platform_oauth_redirect_uri,
+            "device_id": device_id,
+            "screen_hint": "login_or_signup",
+            "max_age": "0",
+            "login_hint": email,
+            "scope": "openid profile email offline_access",
+            "response_type": "code",
+            "response_mode": "query",
+            "state": secrets.token_urlsafe(32),
+            "nonce": secrets.token_urlsafe(32),
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "auth0Client": platform_auth0_client,
+        }
+        nav_h = dict(navigate_headers)
+        nav_h["referer"] = f"{platform_base}/"
+        resp, error = request_with_local_retry(session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=nav_h, allow_redirects=False, verify=False)
+        if resp is None:
+            raise RuntimeError(error or "relogin_authorize_failed")
+        if resp.status_code in (302, 303, 307, 308):
+            location = str(resp.headers.get("Location") or "").strip()
+            if location:
+                login_url = f"{auth_base}{location}" if location.startswith("/") else location
+                nav2 = dict(navigate_headers)
+                nav2["referer"] = f"{auth_base}/log-in"
+                request_with_local_retry(session, "get", login_url, headers=nav2, allow_redirects=False, verify=False)
+        jh = dict(common_headers)
+        jh["referer"] = f"{auth_base}/log-in/password"
+        jh["oai-device-id"] = device_id
+        jh.update(_make_trace_headers())
+        jh["openai-sentinel-token"] = build_sentinel_token(session, device_id, "password_verify")
+        resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/password/verify", json={"password": password}, headers=jh, allow_redirects=False, verify=False)
+        if resp is None or resp.status_code != 200:
+            body = resp.text[:500] if resp is not None else ""
+            log_service.add(LOG_TYPE_ACCOUNT, "重登 password/verify 失败",
+                            {"email": email, "status": getattr(resp, "status_code", "none"), "body": body[:300]})
+            raise RuntimeError(error or f"password_verify_http_{getattr(resp, 'status_code', 'unknown')}{' body:' + body if body else ''}")
+        payload = _response_json(resp)
+        continue_url = str(payload.get("continue_url") or "").strip()
+        page_type = str(((payload.get("page") or {}).get("type")) or "")
+        if page_type == "email_otp_verification" or "email-verification" in continue_url or "email-otp" in continue_url:
+            # Explicitly trigger OTP send to ensure email delivery
+            otp_send_h = dict(navigate_headers)
+            otp_send_h["referer"] = f"{auth_base}/log-in/password"
+            otp_send_h["oai-device-id"] = device_id
+            otp_send_h.update(_make_trace_headers())
+            send_resp, send_err = request_with_local_retry(session, "get", f"{auth_base}/api/accounts/email-otp/send", headers=otp_send_h, allow_redirects=True, verify=False)
+            send_status = getattr(send_resp, "status_code", None)
+            send_body = (send_resp.text[:300] if send_resp is not None else send_err) or ""
+            log(f"[relogin] {email} OTP send: status={send_status}, body={send_body}", "yellow")
+            if send_resp is None or send_status not in (200, 302):
+                raise RuntimeError(f"send_otp_http_{send_status}: {send_body}")
+            _cleanup_expired_sessions()
+            session_id = secrets.token_urlsafe(16)
+            with _relogin_lock:
+                _relogin_sessions[session_id] = {
+                    "session": session,
+                    "device_id": device_id,
+                    "code_verifier": code_verifier,
+                    "expires_at": time.time() + 300,
+                }
+            _keep_session = True
+            return {"otp_required": True, "session_id": session_id}
+        if not continue_url:
+            continue_url = f"{auth_base}/sign-in-with-chatgpt/codex/consent"
+        tokens = exchange_platform_tokens(session, device_id, code_verifier, continue_url)
+        if not tokens:
+            raise RuntimeError("relogin_exchange_failed")
+        log_service.add(LOG_TYPE_ACCOUNT, "重登成功（密码模式）", {"email": email})
+        return tokens
+    finally:
+        if not _keep_session:
+            session.close()
+
+
+# ── OTP-based relogin session store ──
+_relogin_sessions: dict[str, dict] = {}
+_relogin_lock = threading.Lock()
+
+
+def _cleanup_expired_sessions() -> None:
+    now = time.time()
+    with _relogin_lock:
+        expired = [k for k, v in _relogin_sessions.items() if v.get("expires_at", 0) < now]
+        for k in expired:
+            s = _relogin_sessions.pop(k, None)
+            if s:
+                try:
+                    s["session"].close()
+                except Exception:
+                    pass
+
+
+def relogin_send_otp(proxy: str, email: str) -> str:
+    """Send OTP for passwordless login. Returns session_id (store in _relogin_sessions)."""
+    log_service.add(LOG_TYPE_ACCOUNT, "重登 OTP 发送开始", {"email": email})
+    _cleanup_expired_sessions()
+    session = create_session(proxy)
+    device_id = str(uuid.uuid4())
+    session.cookies.set("oai-did", device_id, domain=".auth.openai.com")
+    session.cookies.set("oai-did", device_id, domain="auth.openai.com")
+    try:
+        code_verifier, code_challenge = _generate_pkce()
+        params = {
+            "issuer": auth_base,
+            "client_id": platform_oauth_client_id,
+            "audience": platform_oauth_audience,
+            "redirect_uri": platform_oauth_redirect_uri,
+            "device_id": device_id,
+            "screen_hint": "login_or_signup",
+            "max_age": "0",
+            "login_hint": email,
+            "scope": "openid profile email offline_access",
+            "response_type": "code",
+            "response_mode": "query",
+            "state": secrets.token_urlsafe(32),
+            "nonce": secrets.token_urlsafe(32),
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "auth0Client": platform_auth0_client,
+        }
+        nav_h = dict(navigate_headers)
+        nav_h["referer"] = f"{platform_base}/"
+        resp, error = request_with_local_retry(session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=nav_h, allow_redirects=False, verify=False)
+        if resp is None:
+            raise RuntimeError(error or "relogin_authorize_failed")
+        if resp.status_code in (302, 303, 307, 308):
+            location = str(resp.headers.get("Location") or "").strip()
+            if location:
+                login_url = f"{auth_base}{location}" if location.startswith("/") else location
+                nav2 = dict(navigate_headers)
+                nav2["referer"] = f"{auth_base}/log-in"
+                request_with_local_retry(session, "get", login_url, headers=nav2, allow_redirects=False, verify=False)
+        otp_h = dict(navigate_headers)
+        otp_h["referer"] = f"{auth_base}/log-in/password"
+        otp_h["oai-device-id"] = device_id
+        otp_h.update(_make_trace_headers())
+        resp, error = request_with_local_retry(session, "get", f"{auth_base}/api/accounts/email-otp/send", headers=otp_h, allow_redirects=True, verify=False)
+        if resp is None or resp.status_code not in (200, 302):
+            raise RuntimeError(error or f"send_otp_http_{getattr(resp, 'status_code', 'unknown')}")
+        session_id = secrets.token_urlsafe(16)
+        with _relogin_lock:
+            _relogin_sessions[session_id] = {
+                "session": session,
+                "device_id": device_id,
+                "code_verifier": code_verifier,
+                "expires_at": time.time() + 300,
+            }
+        log_service.add(LOG_TYPE_ACCOUNT, "重登 OTP 已发送", {"email": email})
+        return session_id
+    except Exception as exc:
+        session.close()
+        log_service.add(LOG_TYPE_ACCOUNT, "重登 OTP 发送失败", {"email": email, "error": str(exc)})
+        raise
+
+
+def relogin_submit_otp(session_id: str, code: str) -> dict:
+    """Validate OTP code and exchange for OAuth tokens. Cleans up session store."""
+    _cleanup_expired_sessions()
+    with _relogin_lock:
+        state = _relogin_sessions.pop(session_id, None)
+    if state is None:
+        raise RuntimeError("验证码会话已过期，请重新尝试")
+    session = state["session"]
+    device_id = state["device_id"]
+    code_verifier = state["code_verifier"]
+    try:
+        resp, error = validate_otp(session, device_id, code)
+        if resp is None or resp.status_code != 200:
+            log_service.add(LOG_TYPE_ACCOUNT, "重登 OTP 验证失败",
+                            {"status": getattr(resp, "status_code", "none"), "error": str(error or "")[:300]})
+            raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}")
+        body = _response_json(resp)
+        continue_url = str(body.get("continue_url") or "").strip()
+        if not continue_url:
+            continue_url = f"{auth_base}/sign-in-with-chatgpt/codex/consent"
+        log_service.add(LOG_TYPE_ACCOUNT, "重登 OTP 验证通过，开始换取 token",
+                        {"continue_url": continue_url[:120]})
+        tokens = exchange_platform_tokens(session, device_id, code_verifier, continue_url)
+        if not tokens:
+            raise RuntimeError("token换取失败")
+        log_service.add(LOG_TYPE_ACCOUNT, "重登成功（OTP 模式）",
+                        {"email": str(tokens.get("email") or "")[:100]})
+        return tokens
+    finally:
+        session.close()
 
 
 class PlatformRegistrar:
@@ -433,6 +685,11 @@ class PlatformRegistrar:
 
     def close(self) -> None:
         self.session.close()
+
+    def _clear_auth_cookies(self) -> None:
+        self.session.cookies.clear()
+        self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
+        self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
 
     def _navigate_headers(self, referer: str = "") -> dict[str, str]:
         headers = dict(navigate_headers)
@@ -538,15 +795,21 @@ class PlatformRegistrar:
             "code_challenge_method": "S256",
             "auth0Client": platform_auth0_client,
         }
-        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
+        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=False, verify=False)
         if resp is None:
             raise RuntimeError(error or "platform_login_authorize_failed")
+        if resp.status_code in (302, 303, 307, 308):
+            location = str(resp.headers.get("Location") or "").strip()
+            if location:
+                login_url = f"{auth_base}{location}" if location.startswith("/") else location
+                request_with_local_retry(self.session, "get", login_url, headers=self._navigate_headers(f"{auth_base}/log-in"), allow_redirects=False, verify=False)
         step(index, "登录 authorize 完成")
         headers = self._json_headers(f"{auth_base}/log-in/password")
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "password_verify")
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/password/verify", json={"password": password}, headers=headers, allow_redirects=False, verify=False)
         if resp is None or resp.status_code != 200:
-            raise RuntimeError(error or f"password_verify_http_{getattr(resp, 'status_code', 'unknown')}")
+            body = resp.text[:500] if resp is not None else ""
+            raise RuntimeError(error or f"password_verify_http_{getattr(resp, 'status_code', 'unknown')}{' body:' + body if body else ''}")
         step(index, "密码校验完成")
         payload = _response_json(resp)
         continue_url = str(payload.get("continue_url") or "").strip()
@@ -592,6 +855,8 @@ class PlatformRegistrar:
         step(index, f"收到注册验证码: {code}")
         self._validate_otp(code, index)
         self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
+        time.sleep(3)
+        self._clear_auth_cookies()
         tokens = self._login_and_exchange_tokens(email, password, mailbox, index)
         return {
             "email": email,
@@ -600,6 +865,7 @@ class PlatformRegistrar:
             "refresh_token": str(tokens.get("refresh_token") or "").strip(),
             "id_token": str(tokens.get("id_token") or "").strip(),
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "refresh_token_expires_at": tokens.get("refresh_token_expires_at"),
         }
 
 
@@ -611,7 +877,14 @@ def worker(index: int) -> dict:
         result = registrar.register(index)
         cost = time.time() - start
         access_token = str(result["access_token"])
-        account_service.add_accounts([access_token])
+        account_service.add_accounts([{
+            "access_token": result["access_token"],
+            "refresh_token": result["refresh_token"],
+            "email": result["email"],
+            "password": result["password"],
+            "created_at": result["created_at"],
+            "refresh_token_expires_at": result.get("refresh_token_expires_at"),
+        }])
         account_service.refresh_accounts([access_token])
         with stats_lock:
             stats["done"] += 1

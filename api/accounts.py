@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from services.auth_service import auth_service
@@ -37,6 +38,9 @@ class UserKeyUpdateRequest(BaseModel):
 class AccountCreateRequest(BaseModel):
     tokens: list[str] = Field(default_factory=list)
 
+class AccountImportRequest(BaseModel):
+    tokens: list[dict] = Field(default_factory=list)
+
 
 class AccountDeleteRequest(BaseModel):
     tokens: list[str] = Field(default_factory=list)
@@ -51,6 +55,12 @@ class AccountUpdateRequest(BaseModel):
     type: str | None = None
     status: str | None = None
     quota: int | None = None
+
+
+class AccountReloginRequest(BaseModel):
+    access_token: str = ""
+    code: str = ""
+    session_id: str = ""
 
 
 class CPAPoolCreateRequest(BaseModel):
@@ -161,6 +171,42 @@ def create_router() -> APIRouter:
             "items": refresh_result.get("items", result.get("items", [])),
         }
 
+
+    @router.post("/api/accounts/import")
+    async def import_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        tokens_raw = [str(token or "").strip() for token in body.tokens if str(token or "").strip()]
+        if not tokens_raw:
+            raise HTTPException(status_code=400, detail={"error": "tokens is required"})
+        import csv, io
+        account_dicts: list[dict] = []
+        for line in tokens_raw:
+            line = line.lstrip("\ufeff")
+            for row in csv.DictReader(io.StringIO(line)):
+                at = str(row.get('access_token') or '').strip()
+                if not at:
+                    continue
+                account_dicts.append({
+                    'access_token': at,
+                    'refresh_token': str(row.get('refresh_token') or '').strip(),
+                    'email': str(row.get('email') or '').strip(),
+                    'password': str(row.get('password') or '').strip(),
+                    'type': str(row.get('type') or 'free').strip() or 'free',
+                    'status': str(row.get('status') or '正常').strip() or '正常',
+                    'created_at': str(row.get('created_at') or '').strip() or None,
+                })
+        if not account_dicts:
+            raise HTTPException(status_code=400, detail={"error": "CSV 中未解析到有效的 access_token"})
+        result = account_service.add_accounts(account_dicts)
+        access_tokens = [item['access_token'] for item in account_dicts]
+        refresh_result = account_service.refresh_accounts(access_tokens)
+        return {
+            **result,
+            "refreshed": refresh_result.get("refreshed", 0),
+            "errors": refresh_result.get("errors", []),
+            "items": refresh_result.get("items", result.get("items", [])),
+        }
+
     @router.delete("/api/accounts")
     async def delete_accounts(body: AccountDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -192,6 +238,105 @@ def create_router() -> APIRouter:
         if account is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
         return {"item": account, "items": account_service.list_accounts()}
+
+    @router.post("/api/accounts/relogin")
+    async def relogin_account(body: AccountReloginRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        access_token = str(body.access_token or "").strip()
+        if not access_token:
+            raise HTTPException(status_code=400, detail={"error": "access_token is required"})
+        current = account_service.get_account(access_token)
+        if current is None:
+            raise HTTPException(status_code=404, detail={"error": "account not found"})
+        email = str(current.get("email") or "").strip()
+        if not email:
+            raise HTTPException(status_code=400, detail={"error": "该账号没有邮箱，无法重登"})
+
+        code = str(body.code or "").strip()
+        session_id = str(body.session_id or "").strip()
+
+        # ── OTP flow: validate code and complete login ──
+        if code and session_id:
+            from services.register.openai_register import relogin_submit_otp
+            def _run() -> dict:
+                return relogin_submit_otp(session_id, code)
+            try:
+                tokens = await run_in_threadpool(_run)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+            new_access_token = str(tokens.get("access_token") or "").strip()
+            new_refresh_token = str(tokens.get("refresh_token") or "").strip()
+            refresh_token_expires_at = tokens.get("refresh_token_expires_at")
+            if not new_access_token:
+                raise HTTPException(status_code=502, detail={"error": "重登未获取到有效 token"})
+            account_service.replace_token(access_token, new_access_token, {
+                "refresh_token": new_refresh_token,
+                "refresh_token_expires_at": refresh_token_expires_at,
+                "status": "正常",
+            })
+            return {"items": account_service.list_accounts()}
+
+        # ── Password flow (handles OTP if required) ──
+        password = str(current.get("password") or "").strip()
+        if password:
+            from services.config import config
+            from services.register.openai_register import relogin_and_get_tokens
+            def _run() -> dict:
+                return relogin_and_get_tokens(config.get_proxy_settings(), email, password)
+            try:
+                tokens = await run_in_threadpool(_run)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+            if tokens.get("otp_required"):
+                return {"otp_sent": True, "session_id": tokens["session_id"], "email": email}
+            new_access_token = str(tokens.get("access_token") or "").strip()
+            new_refresh_token = str(tokens.get("refresh_token") or "").strip()
+            refresh_token_expires_at = tokens.get("refresh_token_expires_at")
+            if not new_access_token:
+                raise HTTPException(status_code=502, detail={"error": "重登未获取到有效 token"})
+            account_service.replace_token(access_token, new_access_token, {
+                "refresh_token": new_refresh_token,
+                "refresh_token_expires_at": refresh_token_expires_at,
+                "password": password,
+                "status": "正常",
+            })
+            return {"items": account_service.list_accounts()}
+
+        # ── Passwordless flow: send OTP and wait for manual code ──
+        from services.config import config
+        from services.register.openai_register import relogin_send_otp
+        def _run() -> str:
+            return relogin_send_otp(config.get_proxy_settings(), email)
+        try:
+            new_session_id = await run_in_threadpool(_run)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+        return {"otp_sent": True, "session_id": new_session_id, "email": email}
+
+    @router.get("/api/accounts/export")
+    async def export_accounts(format: str = "csv", authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        accounts = account_service.list_accounts()
+        if format == "csv":
+            import csv
+            import io
+
+            output = io.StringIO()
+            output.write("\ufeff")
+            fields = ["email", "password", "access_token", "refresh_token", "type", "status", "quota", "created_at", "success", "fail", "last_used_at"]
+            writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(accounts)
+            content = output.getvalue()
+            return Response(
+                content=content,
+                media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition": f"attachment; filename=accounts-export.csv"},
+            )
+        import json
+        sensitive_fields: list[str] = ["email", "password", "access_token", "refresh_token", "type", "status", "quota", "created_at", "success", "fail", "last_used_at"]
+        filtered = [{k: v for k, v in acc.items() if k in sensitive_fields} for acc in accounts]
+        return {"items": filtered}
 
     @router.get("/api/cpa/pools")
     async def list_cpa_pools(authorization: str | None = Header(default=None)):

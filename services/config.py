@@ -202,6 +202,20 @@ class ConfigStore:
         return bool(value)
 
     @property
+    def token_refresh_interval_minute(self) -> int:
+        try:
+            return max(1, int(self.data.get("token_refresh_interval_minute", 10)))
+        except (TypeError, ValueError):
+            return 10
+
+    @property
+    def token_refresh_before_expiry_seconds(self) -> int:
+        try:
+            return max(60, int(self.data.get("token_refresh_before_expiry_seconds", 300)))
+        except (TypeError, ValueError):
+            return 300
+
+    @property
     def auto_remove_rate_limited_accounts(self) -> bool:
         value = self.data.get("auto_remove_rate_limited_accounts", False)
         if isinstance(value, str):
@@ -279,6 +293,8 @@ class ConfigStore:
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_account_concurrency"] = self.image_account_concurrency
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
+        data["token_refresh_interval_minute"] = self.token_refresh_interval_minute
+        data["token_refresh_before_expiry_seconds"] = self.token_refresh_before_expiry_seconds
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words

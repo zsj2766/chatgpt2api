@@ -9,9 +9,12 @@ import {
   ChevronRight,
   CircleAlert,
   CircleOff,
+  Clock,
   Copy,
   Download,
+  Eye,
   LoaderCircle,
+  LogIn,
   Pencil,
   RefreshCw,
   Search,
@@ -42,11 +45,14 @@ import {
 } from "@/components/ui/select";
 import {
   deleteAccounts,
+  exportAccounts,
   fetchAccounts,
+  reloginAccount,
   refreshAccounts,
   updateAccount,
   type Account,
   type AccountStatus,
+  type ReloginResponse,
 } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { cn } from "@/lib/utils";
@@ -58,6 +64,7 @@ const accountStatusOptions: { label: string; value: AccountStatus | "all" }[] = 
   { label: "正常", value: "正常" },
   { label: "限流", value: "限流" },
   { label: "异常", value: "异常" },
+  { label: "过期", value: "过期" },
   { label: "禁用", value: "禁用" },
 ];
 
@@ -71,6 +78,7 @@ const statusMeta: Record<
   正常: { icon: CheckCircle2, badge: "success" },
   限流: { icon: CircleAlert, badge: "warning" },
   异常: { icon: CircleOff, badge: "danger" },
+  过期: { icon: Clock, badge: "secondary" },
   禁用: { icon: Ban, badge: "secondary" },
 };
 
@@ -79,6 +87,7 @@ const metricCards = [
   { key: "active", label: "正常账户", color: "text-emerald-600", icon: CheckCircle2 },
   { key: "limited", label: "限流账户", color: "text-orange-500", icon: CircleAlert },
   { key: "abnormal", label: "异常账户", color: "text-rose-500", icon: CircleOff },
+  { key: "expired", label: "过期账户", color: "text-stone-400", icon: Clock },
   { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
@@ -149,15 +158,39 @@ function maskToken(token?: string) {
   return `${token.slice(0, 16)}...${token.slice(-8)}`;
 }
 
-function downloadTokens(accounts: Account[]) {
-  const content = `${accounts.map((account) => account.access_token).join("\n")}\n`;
-  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `accounts-${Date.now()}.txt`;
-  link.click();
-  URL.revokeObjectURL(url);
+function decodeJwtExp(token: string): number {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return 0;
+    let payload = parts[1];
+    const pad = 4 - (payload.length % 4);
+    if (pad !== 4) payload += "=".repeat(pad);
+    const claims = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof claims.exp === "number" ? claims.exp : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function formatExpiry(ts: number | null | undefined): string {
+  if (!ts) return "—";
+  const d = new Date(ts * 1000);
+  if (isNaN(d.getTime())) return "—";
+  const now = Date.now();
+  const remain = d.getTime() - now;
+  const remainStr = remain > 0
+    ? ` (剩余 ${Math.floor(remain / 3600000)}h ${Math.floor((remain % 3600000) / 60000)}m)`
+    : remain > -86400000
+      ? " (已过期)"
+      : " (已失效)";
+  return `${d.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}${remainStr}`;
+}
+
+function formatTimestamp(ts: number | null | undefined): string {
+  if (!ts) return "—";
+  const d = new Date(ts * 1000);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
 }
 
 function displayAccountType(account: Account) {
@@ -175,10 +208,17 @@ function AccountsPageContent() {
   const [pageSize, setPageSize] = useState("10");
   const [editingAccount, setEditingAccount] = useState<Account | null>(null);
   const [editStatus, setEditStatus] = useState<AccountStatus>("正常");
+  const [detailAccount, setDetailAccount] = useState<Account | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [refreshingTokens, setRefreshingTokens] = useState<Set<string>>(new Set());
   const [isDeleting, setIsDeleting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
+  const [isRelogging, setIsRelogging] = useState(false);
+  const [reloggingToken, setReloggingToken] = useState("");
+  const [otpAccount, setOtpAccount] = useState<Account | null>(null);
+  const [otpSessionId, setOtpSessionId] = useState("");
+  const [otpCode, setOtpCode] = useState("");
 
   const loadAccounts = async (silent = false) => {
     if (!silent) {
@@ -293,6 +333,8 @@ function AccountsPageContent() {
     }
 
     setIsRefreshing(true);
+    const tokensSnapshot = [...accessTokens];
+    setRefreshingTokens((prev) => new Set([...prev, ...tokensSnapshot]));
     try {
       const data = await refreshAccounts(accessTokens);
       setAccounts(data.items);
@@ -310,6 +352,11 @@ function AccountsPageContent() {
       toast.error(message);
     } finally {
       setIsRefreshing(false);
+      setRefreshingTokens((prev) => {
+        const next = new Set(prev);
+        tokensSnapshot.forEach((t) => next.delete(t));
+        return next;
+      });
     }
   };
 
@@ -340,6 +387,41 @@ function AccountsPageContent() {
     }
   };
 
+  const handleRelogin = async (accessToken: string, code?: string, sessionId?: string) => {
+    setIsRelogging(true);
+    setReloggingToken(accessToken);
+    try {
+      const data: ReloginResponse = await reloginAccount(accessToken, code, sessionId);
+      if (data.otp_sent && data.session_id) {
+        const account = accounts.find((a) => a.access_token === accessToken);
+        if (account) {
+          setOtpAccount(account);
+          setOtpSessionId(data.session_id);
+          setOtpCode("");
+          toast.info("验证码已发送，请检查邮箱");
+        }
+      } else if (data.items) {
+        setAccounts(data.items);
+        setSelectedIds((prev) => prev.filter((id) => data.items!.some((item) => item.access_token === id)));
+        setOtpAccount(null);
+        setOtpSessionId("");
+        setOtpCode("");
+        toast.success("重登成功");
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "重登失败";
+      toast.error(message);
+    } finally {
+      setIsRelogging(false);
+      setReloggingToken("");
+    }
+  };
+
+  const handleOtpSubmit = () => {
+    if (!otpAccount || !otpCode.trim()) return;
+    void handleRelogin(otpAccount.access_token, otpCode.trim(), otpSessionId);
+  };
+
   const toggleSelectAll = (checked: boolean) => {
     if (checked) {
       setSelectedIds((prev) => Array.from(new Set([...prev, ...currentRows.map((item) => item.access_token)])));
@@ -361,21 +443,13 @@ function AccountsPageContent() {
         <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="outline"
+            title="从后端重新拉取缓存的账号列表，不调用 OpenAI 接口"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
             onClick={() => void loadAccounts()}
             disabled={isLoading || isRefreshing || isDeleting}
           >
             <RefreshCw className={cn("size-4", isLoading ? "animate-spin" : "")} />
-            刷新
-          </Button>
-          <Button
-            variant="outline"
-            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
-            onClick={() => void handleRefreshAccounts(accounts.map((item) => item.access_token))}
-            disabled={isLoading || isRefreshing || isDeleting || accounts.length === 0}
-          >
-            <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
-            一键刷新所有账号信息和额度
+            刷新列表
           </Button>
           <AccountImportDialog
             disabled={isLoading || isRefreshing || isDeleting}
@@ -388,11 +462,13 @@ function AccountsPageContent() {
           <Button
             variant="outline"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
-            onClick={() => downloadTokens(accounts)}
+            onClick={() => {
+              void exportAccounts("csv").catch(() => toast.error("导出失败"));
+            }}
             disabled={accounts.length === 0}
           >
             <Download className="size-4" />
-            导出全部 Token
+            导出账号信息
           </Button>
         </div>
       </section>
@@ -440,6 +516,102 @@ function AccountsPageContent() {
             >
               {isUpdating ? <LoaderCircle className="size-4 animate-spin" /> : null}
               保存修改
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(detailAccount)} onOpenChange={(open) => { if (!open) setDetailAccount(null); }}>
+        <DialogContent showCloseButton={false} className="max-w-md rounded-2xl p-6" onInteractOutside={(e) => e.preventDefault()} onEscapeKeyDown={(e) => e.preventDefault()}>
+          <DialogHeader className="gap-2">
+            <DialogTitle className="text-lg">账号详情</DialogTitle>
+            <DialogDescription className="text-sm leading-6">
+              查看账号完整凭据信息，请妥善保管。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            {detailAccount ? (
+              <>
+                {[
+                  { label: "邮箱", value: detailAccount.email || "—" },
+                  { label: "密码", value: detailAccount.password || "—" },
+                  { label: "Access Token", value: detailAccount.access_token },
+                  { label: "Refresh Token", value: detailAccount.refresh_token || "—" },
+                  { label: "类型", value: displayAccountType(detailAccount) },
+                  { label: "状态", value: detailAccount.status },
+                  { label: "创建时间", value: detailAccount.created_at || "—" },
+                  { label: "AT 过期时间", value: formatExpiry(detailAccount.expires_at) },
+                  { label: "RT 过期时间", value: formatExpiry(detailAccount.refresh_token_expires_at) },
+                  { label: "上次刷新时间", value: formatTimestamp(detailAccount.last_refreshed_at) },
+                ].map(({ label, value }) => (
+                  <div key={label} className="space-y-1">
+                    <div className="text-xs font-medium text-stone-400">{label}</div>
+                    <div className="flex items-center gap-2 rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
+                      <span className="min-w-0 flex-1 break-all text-sm text-stone-700">
+                        {value.length > 80 ? `${value.slice(0, 40)}...${value.slice(-40)}` : value}
+                      </span>
+                      <button
+                        type="button"
+                        className="shrink-0 rounded-lg p-1.5 text-stone-400 transition hover:bg-stone-200 hover:text-stone-700"
+                        onClick={() => {
+                          void navigator.clipboard.writeText(value);
+                          toast.success(`${label} 已复制`);
+                        }}
+                      >
+                        <Copy className="size-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </>
+            ) : null}
+          </div>
+          <DialogFooter className="pt-2">
+            <Button
+              variant="secondary"
+              className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
+              onClick={() => setDetailAccount(null)}
+            >
+              关闭
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(otpAccount)} onOpenChange={(open) => (!open ? (setOtpAccount(null), setOtpSessionId(""), setOtpCode("")) : null)}>
+        <DialogContent showCloseButton={false} className="max-w-sm rounded-2xl p-6">
+          <DialogHeader className="gap-2">
+            <DialogTitle className="text-lg">邮箱验证码</DialogTitle>
+            <DialogDescription className="text-sm leading-6">
+              验证码已发送至 {otpAccount?.email || ""}，请查收后输入。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <Input
+              value={otpCode}
+              onChange={(e) => setOtpCode(e.target.value)}
+              placeholder="请输入 6 位验证码"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+              maxLength={6}
+              onKeyDown={(e) => { if (e.key === "Enter") handleOtpSubmit(); }}
+            />
+          </div>
+          <DialogFooter className="pt-2">
+            <Button
+              variant="secondary"
+              className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
+              onClick={() => (setOtpAccount(null), setOtpSessionId(""), setOtpCode(""))}
+              disabled={isRelogging}
+            >
+              取消
+            </Button>
+            <Button
+              className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+              onClick={handleOtpSubmit}
+              disabled={isRelogging || !otpCode.trim()}
+            >
+              {isRelogging ? <LoaderCircle className="size-4 animate-spin" /> : null}
+              验证
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -555,6 +727,7 @@ function AccountsPageContent() {
               <div className="flex flex-wrap items-center gap-2 text-sm text-stone-500">
                 <Button
                   variant="ghost"
+                  title="调用 OpenAI 接口刷新选中账号的邮箱、类型、额度和限流状态"
                   className="h-8 rounded-lg px-3 text-stone-500 hover:bg-stone-100"
                   onClick={() => void handleRefreshAccounts(selectedTokens)}
                   disabled={selectedTokens.length === 0 || isRefreshing}
@@ -688,6 +861,21 @@ function AccountsPageContent() {
                             <button
                               type="button"
                               className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
+                              onClick={() => setDetailAccount(account)}
+                            >
+                              <Eye className="size-4" />
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
+                              onClick={() => void handleRelogin(account.access_token)}
+                              disabled={isRelogging}
+                            >
+                              {reloggingToken === account.access_token ? <LoaderCircle className="size-4 animate-spin" /> : <LogIn className="size-4" />}
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
                               onClick={() => openEditDialog(account)}
                               disabled={isUpdating}
                             >
@@ -695,11 +883,12 @@ function AccountsPageContent() {
                             </button>
                             <button
                               type="button"
+                              title="调用 OpenAI 接口刷新该账号的邮箱、类型、额度和限流状态"
                               className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
                               onClick={() => void handleRefreshAccounts([account.access_token])}
-                              disabled={isRefreshing}
+                              disabled={refreshingTokens.has(account.access_token)}
                             >
-                              <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
+                              {refreshingTokens.has(account.access_token) ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
                             </button>
                             <button
                               type="button"
