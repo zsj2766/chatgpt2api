@@ -197,7 +197,7 @@ class AccountService:
             self._save_accounts()
 
     def remove_invalid_token(self, access_token: str, event: str) -> bool:
-        self.update_account(access_token, {"status": "异常", "quota": 0})
+        self.update_account(access_token, {"status": "异常", "quota": 0}, source="账号标记异常")
         log_service.add(LOG_TYPE_ACCOUNT, "账号标记异常",
                         {"source": event, "token": anonymize_token(access_token)})
         return False
@@ -298,7 +298,7 @@ class AccountService:
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
 
-    def update_account(self, access_token: str, updates: dict) -> dict | None:
+    def update_account(self, access_token: str, updates: dict, source: str = "更新账号") -> dict | None:
         if not access_token:
             return None
         with self._lock:
@@ -311,12 +311,21 @@ class AccountService:
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
                 self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
+                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {
+                    "token": anonymize_token(access_token),
+                    "email": account.get("email"),
+                    "source": source,
+                })
                 return None
+            changed_fields = [k for k in updates if current.get(k) != account.get(k)]
             self._accounts[access_token] = account
             self._save_accounts()
-            log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
-                            {"token": anonymize_token(access_token), "status": account.get("status")})
+            log_service.add(LOG_TYPE_ACCOUNT, source, {
+                "token": anonymize_token(access_token),
+                "email": account.get("email"),
+                "status": account.get("status"),
+                "changed_fields": changed_fields,
+            })
             return dict(account)
         return None
 
@@ -324,7 +333,7 @@ class AccountService:
         """Replace an account's access_token key and apply updates (used for token rotation)."""
         if not old_token or not new_token or old_token == new_token:
             if old_token and updates:
-                return self.update_account(old_token, updates)
+                return self.update_account(old_token, updates, source="token 替换(同 token 更新)")
             return None
         with self._lock:
             current = self._accounts.pop(old_token, None)
@@ -393,7 +402,7 @@ class AccountService:
             self.remove_invalid_token(access_token, event)
             raise
         result["last_refreshed_at"] = time.time()
-        return self.update_account(access_token, result)
+        return self.update_account(access_token, result, source=f"刷新账号信息({event})")
 
     def refresh_accounts(self, access_tokens: list[str]) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))

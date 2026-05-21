@@ -114,6 +114,7 @@ def start_account_watcher(stop_event: Event) -> Thread:
     _skip_statuses = {"禁用", "异常", "过期"}
 
     def worker() -> None:
+        rate_limit_cooldown = 0
         while not stop_event.is_set():
             try:
                 accounts = account_service.list_accounts()
@@ -142,7 +143,7 @@ def start_account_watcher(stop_event: Event) -> Thread:
                                 if exp - now <= before_expiry:
                                     token_needing_refresh.append(acc)
                             elif exp <= now:
-                                account_service.update_account(access_token, {"status": "过期"})
+                                account_service.update_account(access_token, {"status": "过期"}, source="token 过期(无 refresh_token)")
                                 log_service.add(LOG_TYPE_ACCOUNT, "token 已过期且无 refresh_token",
                                                 {"token": anonymize_token(access_token)})
 
@@ -170,14 +171,22 @@ def start_account_watcher(stop_event: Event) -> Thread:
                         log_service.add(LOG_TYPE_ACCOUNT, "token 自动刷新完成", {"refreshed": refreshed})
                         continue
 
-                # ── Execute rate-limit recoveries ──
-                if limited_needing_refresh:
+                # ── Execute rate-limit recoveries (with cooldown) ──
+                if limited_needing_refresh and now >= rate_limit_cooldown:
                     result = account_service.refresh_accounts(limited_needing_refresh)
-                    recovered = result.get("refreshed", 0)
-                    log_service.add(LOG_TYPE_ACCOUNT, "限流账号自动刷新",
-                                    {"refreshed": recovered, "count": len(limited_needing_refresh)})
-                    if recovered:
-                        continue
+                    requested_set = set(limited_needing_refresh)
+                    actually_recovered = sum(
+                        1 for acc in result.get("items", [])
+                        if str(acc.get("access_token") or "") in requested_set
+                        and acc.get("status") != "限流"
+                    )
+                    log_service.add(LOG_TYPE_ACCOUNT, "限流账号自动刷新", {
+                        "requested": len(requested_set),
+                        "recovered": actually_recovered,
+                        "errors": len(result.get("errors", [])),
+                    })
+                    if actually_recovered == 0:
+                        rate_limit_cooldown = now + min(max_interval, 300)
 
                 # ── Sleep until next event ──
                 sleep_sec = max_interval
@@ -185,6 +194,8 @@ def start_account_watcher(stop_event: Event) -> Thread:
                     sleep_sec = min(sleep_sec, max(60, nearest_token_event - now - before_expiry))
                 if nearest_restore_event and nearest_restore_event > now:
                     sleep_sec = min(sleep_sec, max(60, nearest_restore_event - now))
+                if rate_limit_cooldown > now:
+                    sleep_sec = min(sleep_sec, max(60, rate_limit_cooldown - now))
                 stop_event.wait(sleep_sec)
 
             except Exception as exc:
