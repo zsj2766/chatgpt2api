@@ -12,8 +12,10 @@ import {
   CircleOff,
   Copy,
   Download,
+  Eye,
   Link2,
   LoaderCircle,
+  LogIn,
   Pencil,
   RefreshCw,
   Search,
@@ -47,6 +49,7 @@ import {
   fetchAccounts,
   fetchModels,
   refreshAccounts,
+  reloginAccount,
   testProxy,
   updateAccount,
   type Account,
@@ -86,6 +89,7 @@ const metricCards = [
   { key: "active", label: "正常账户", color: "text-emerald-600", icon: CheckCircle2 },
   { key: "limited", label: "限流账户", color: "text-orange-500", icon: CircleAlert },
   { key: "abnormal", label: "异常账户", color: "text-rose-500", icon: CircleOff },
+  { key: "expired", label: "过期账户", color: "text-stone-400", icon: Clock },
   { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
@@ -182,6 +186,39 @@ function displayAccountSource(account: Account) {
   return source;
 }
 
+function decodeJwtExp(token: string): number {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return 0;
+    let payload = parts[1];
+    const pad = 4 - (payload.length % 4);
+    if (pad !== 4) payload += "=".repeat(pad);
+    const claims = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof claims.exp === "number" ? claims.exp : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function formatExpiry(ts: number | null | undefined): string {
+  if (!ts) return "—";
+  const d = new Date(ts * 1000);
+  if (isNaN(d.getTime())) return "—";
+  const now = Date.now();
+  const remain = d.getTime() - now;
+  const remainStr = remain > 0
+    ? ` (剩余 ${Math.floor(remain / 3600000)}h ${Math.floor((remain % 3600000) / 60000)}m)`
+    : remain > -86400000 ? " (已过期)" : " (已失效)";
+  return `${d.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}${remainStr}`;
+}
+
+function formatTimestamp(ts: number | null | undefined): string {
+  if (!ts) return "—";
+  const d = new Date(ts * 1000);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+}
+
 function AccountsPageContent() {
   const didLoadRef = useRef(false);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -196,6 +233,11 @@ function AccountsPageContent() {
   const [editStatus, setEditStatus] = useState<AccountStatus>("正常");
   const [editProxy, setEditProxy] = useState("");
   const [isTestingProxy, setIsTestingProxy] = useState(false);
+  const [detailAccount, setDetailAccount] = useState<Account | null>(null);
+  const [reloginAccount_, setReloginAccount] = useState<Account | null>(null);
+  const [reloginOtpCode, setReloginOtpCode] = useState("");
+  const [reloginSessionId, setReloginSessionId] = useState("");
+  const [isRelogining, setIsRelogining] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -265,10 +307,11 @@ function AccountsPageContent() {
     const active = accounts.filter((item) => item.status === "正常").length;
     const limited = accounts.filter((item) => item.status === "限流").length;
     const abnormal = accounts.filter((item) => item.status === "异常").length;
+    const expired = accounts.filter((item) => item.status === "过期").length;
     const disabled = accounts.filter((item) => item.status === "禁用").length;
     const quota = formatQuotaSummary(accounts);
 
-    return { total, active, limited, abnormal, disabled, quota };
+    return { total, active, limited, abnormal, expired, disabled, quota };
   }, [accounts]);
 
   const accountTypeOptions = useMemo(
@@ -405,6 +448,49 @@ function AccountsPageContent() {
     setSelectedIds((prev) => prev.filter((id) => !currentRows.some((row) => row.access_token === id)));
   };
 
+  const handleRelogin = async (account: Account) => {
+    setIsRelogining(true);
+    try {
+      const result = await reloginAccount({
+        access_token: account.access_token,
+        email: account.email ?? "",
+        password: account.password ?? "",
+      });
+      if (result.otp_required && result.session_id) {
+        setReloginAccount(account);
+        setReloginSessionId(result.session_id);
+        setReloginOtpCode("");
+        return;
+      }
+      toast.success("重登成功");
+      void loadAccounts(true);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "重登失败");
+    } finally {
+      setIsRelogining(false);
+    }
+  };
+
+  const handleOtpSubmit = async () => {
+    if (!reloginAccount_ || !reloginSessionId || !reloginOtpCode.trim()) return;
+    setIsRelogining(true);
+    try {
+      await reloginAccount({
+        session_id: reloginSessionId,
+        code: reloginOtpCode.trim(),
+        email: reloginAccount_.email ?? "",
+      });
+      toast.success("重登成功");
+      setReloginAccount(null);
+      setReloginSessionId("");
+      void loadAccounts(true);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "OTP 验证失败");
+    } finally {
+      setIsRelogining(false);
+    }
+  };
+
   return (
     <>
       <section className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
@@ -517,6 +603,66 @@ function AccountsPageContent() {
             >
               {isUpdating ? <LoaderCircle className="size-4 animate-spin" /> : null}
               保存修改
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(detailAccount)} onOpenChange={(open) => (!open ? setDetailAccount(null) : null)}>
+        <DialogContent showCloseButton={false} className="rounded-2xl p-6">
+          <DialogHeader className="gap-2">
+            <DialogTitle>账号详情</DialogTitle>
+            <DialogDescription className="text-sm leading-6">
+              {detailAccount?.email ?? "—"}
+            </DialogDescription>
+          </DialogHeader>
+          {detailAccount ? (
+            <div className="space-y-2 text-sm">
+              <div className="flex justify-between"><span className="text-stone-500">状态</span><span>{detailAccount.status}</span></div>
+              <div className="flex justify-between"><span className="text-stone-500">类型</span><span>{displayAccountType(detailAccount)}</span></div>
+              <div className="flex justify-between"><span className="text-stone-500">来源</span><span>{displayAccountSource(detailAccount)}</span></div>
+              <div className="flex justify-between"><span className="text-stone-500">额度</span><span>{formatQuota(detailAccount)}</span></div>
+              <div className="flex justify-between"><span className="text-stone-500">代理</span><span>{detailAccount.proxy || "—"}</span></div>
+              <div className="flex justify-between"><span className="text-stone-500">Token 过期</span><span>{formatExpiry(detailAccount.expires_at ?? decodeJwtExp(detailAccount.access_token))}</span></div>
+              <div className="flex justify-between"><span className="text-stone-500">最后刷新</span><span>{formatTimestamp(detailAccount.last_refreshed_at as any)}</span></div>
+              <div className="flex justify-between"><span className="text-stone-500">恢复时间</span><span>{formatRestoreAt(detailAccount.restore_at).absolute}</span></div>
+              <div className="flex justify-between"><span className="text-stone-500">创建时间</span><span>{(() => { const r = (detailAccount as any).created_at; if (!r) return "—"; try { return new Date(r + "Z").toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }); } catch { return r; } })()}</span></div>
+              <div className="mt-2 rounded-lg bg-stone-50 p-2 font-mono text-xs break-all text-stone-600">
+                access_token: {detailAccount.access_token.slice(0, 32)}...
+              </div>
+              {detailAccount.refresh_token && (
+                <div className="rounded-lg bg-stone-50 p-2 font-mono text-xs break-all text-stone-600">
+                  refresh_token: {detailAccount.refresh_token.slice(0, 32)}...
+                </div>
+              )}
+            </div>
+          ) : null}
+          <DialogFooter className="pt-2">
+            <Button variant="secondary" className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200" onClick={() => setDetailAccount(null)}>关闭</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(reloginAccount_)} onOpenChange={(open) => (!open ? setReloginAccount(null) : null)}>
+        <DialogContent showCloseButton={false} className="rounded-2xl p-6">
+          <DialogHeader className="gap-2">
+            <DialogTitle>输入验证码</DialogTitle>
+            <DialogDescription className="text-sm leading-6">
+              {reloginAccount_?.email ?? "—"} 需要邮箱验证码才能完成重登
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Input
+              value={reloginOtpCode}
+              onChange={(e) => setReloginOtpCode(e.target.value)}
+              placeholder="输入6位验证码"
+              className="h-11 rounded-xl border-stone-200 bg-white text-center text-lg tracking-widest"
+            />
+          </div>
+          <DialogFooter className="pt-2">
+            <Button variant="secondary" className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200" onClick={() => setReloginAccount(null)} disabled={isRelogining}>取消</Button>
+            <Button className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800" onClick={() => void handleOtpSubmit()} disabled={isRelogining || !reloginOtpCode.trim()}>
+              {isRelogining ? <LoaderCircle className="size-4 animate-spin" /> : null} 提交
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -819,10 +965,25 @@ function AccountsPageContent() {
                             <button
                               type="button"
                               className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
+                              onClick={() => setDetailAccount(account)}
+                            >
+                              <Eye className="size-4" />
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
                               onClick={() => openEditDialog(account)}
                               disabled={isUpdating}
                             >
                               <Pencil className="size-4" />
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
+                              onClick={() => void handleRelogin(account)}
+                              disabled={isRelogining}
+                            >
+                              {isRelogining ? <LoaderCircle className="size-4 animate-spin" /> : <LogIn className="size-4" />}
                             </button>
                             <button
                               type="button"
