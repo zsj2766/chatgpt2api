@@ -12,7 +12,13 @@ from email.utils import parsedate_to_datetime
 from threading import Lock
 from typing import Any, Callable, TypeVar
 
-from curl_cffi import requests
+import requests
+import urllib3
+from curl_cffi import requests as curl_requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 from services.config import DATA_DIR
@@ -105,10 +111,17 @@ def _normalize_string_list(value: Any) -> list[str]:
 
 def _create_session(conf: dict):
     proxy = str(conf.get("proxy") or "").strip()
-    kwargs = {"impersonate": "chrome", "verify": False}
+    if proxy and (proxy.lower().startswith("socks5://") or proxy.lower().startswith("socks5h://")):
+        return curl_requests.Session(impersonate="chrome136", verify=False, proxy=proxy)
+    session = requests.Session()
+    retry = Retry(total=2, connect=2, read=2, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.verify = False
     if proxy:
-        kwargs["proxy"] = proxy
-    return requests.Session(**kwargs)
+        session.proxies.update({"http": proxy, "https": proxy})
+    return session
 
 
 def _parse_received_at(value: Any) -> datetime | None:
