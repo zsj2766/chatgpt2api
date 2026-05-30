@@ -360,42 +360,56 @@ def extract_oauth_callback_params_from_url(url: str) -> dict[str, str] | None:
     return {"code": code, "state": str((params.get("state") or [""])[0]).strip(), "scope": str((params.get("scope") or [""])[0]).strip()}
 
 
-def request_platform_oauth_token(session: requests.Session, code: str, code_verifier: str) -> dict | None:
-    headers = {
-        "accept": "*/*",
-        "accept-language": "zh-CN,zh;q=0.9",
-        "auth0-client": platform_auth0_client,
-        "cache-control": "no-cache",
-        "content-type": "application/json",
-        "origin": platform_base,
-        "pragma": "no-cache",
-        "priority": "u=1, i",
-        "referer": f"{platform_base}/",
-        "sec-ch-ua": sec_ch_ua,
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-site",
-        "user-agent": user_agent,
-    }
-    resp = session.post(
-        f"{auth_base}/api/accounts/oauth/token",
-        headers=headers,
-        json={
-            "client_id": platform_oauth_client_id,
-            "code_verifier": code_verifier,
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": platform_oauth_redirect_uri,
-        },
-        verify=False,
-        timeout=60,
-    )
-    if resp.status_code != 200:
-        print(resp.text)
-        return None
-    return _response_json(resp)
+def _exchange_oauth_token(code: str, code_verifier: str) -> dict | None:
+    """Exchange OAuth authorization code for tokens via /oauth/token (form-encoded)."""
+    session = create_session(config["proxy"])
+    try:
+        resp = session.post(
+            f"{auth_base}/oauth/token",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": platform_oauth_redirect_uri,
+                "client_id": platform_oauth_client_id,
+                "code_verifier": code_verifier,
+            },
+            verify=False,
+            timeout=60,
+        )
+        data = _response_json(resp)
+        if resp.status_code != 200 or not data.get("access_token") or not data.get("refresh_token") or not data.get("id_token"):
+            log(f"[exchange] /oauth/token 失败: status={resp.status_code}, body={json.dumps(data, ensure_ascii=False)[:300]}", "red")
+            return None
+        payload = _decode_jwt_payload(str(data.get("id_token") or "")) or _decode_jwt_payload(str(data.get("access_token") or ""))
+        refresh_token_expires_at = None
+        rt_expires_in = data.get("refresh_token_expires_in")
+        if rt_expires_in is not None:
+            try:
+                refresh_token_expires_at = int(time.time()) + int(rt_expires_in)
+            except (TypeError, ValueError):
+                pass
+        if refresh_token_expires_at is None:
+            rt_payload = _decode_jwt_payload(str(data.get("refresh_token") or ""))
+            rt_exp = rt_payload.get("exp")
+            if rt_exp:
+                try:
+                    refresh_token_expires_at = int(rt_exp)
+                except (TypeError, ValueError):
+                    pass
+        if refresh_token_expires_at is None:
+            refresh_token_expires_at = int(time.time()) + 86400 * 30
+        email = str(payload.get("email") or "").strip()
+        log(f"[exchange] token 交换成功: {email}, rt_expires_in={rt_expires_in}", "green")
+        return {
+            "email": email,
+            "access_token": str(data.get("access_token") or "").strip(),
+            "refresh_token": str(data.get("refresh_token") or "").strip(),
+            "id_token": str(data.get("id_token") or "").strip(),
+            "refresh_token_expires_at": refresh_token_expires_at,
+        }
+    finally:
+        session.close()
 
 
 class PlatformRegistrar:
@@ -505,7 +519,9 @@ class PlatformRegistrar:
 
     def _exchange_registered_tokens(self, index: int) -> dict:
         step(index, "开始换 token")
-        tokens = request_platform_oauth_token(self.session, self.platform_auth_code, self.code_verifier)
+        if not self.platform_auth_code:
+            raise RuntimeError("create_account 未返回 auth code")
+        tokens = _exchange_oauth_token(self.platform_auth_code, self.code_verifier)
         if not tokens:
             raise RuntimeError("token换取失败")
         step(index, "token 换取完成")
@@ -540,6 +556,7 @@ class PlatformRegistrar:
             "id_token": str(tokens.get("id_token") or "").strip(),
             "source_type": "web",
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "refresh_token_expires_at": tokens.get("refresh_token_expires_at"),
         }
 
 
@@ -647,21 +664,17 @@ def _exchange_relogin_tokens(session: requests.Session, device_id: str, code_ver
     if not code:
         callback_params = extract_oauth_callback_params_from_consent_session(session, consent_url, device_id)
         if not callback_params:
-            log("[relogin] 重登 token 换取失败：无法提取 OAuth 回调参数", "red")
+            log(f"[relogin] 重登 token 换取失败：无法提取 OAuth 回调参数, consent_url={consent_url[:120]}", "red")
             return None
         code = str(callback_params.get("code") or "").strip()
     if not code:
         log("[relogin] 重登 token 换取失败：回调参数中缺少 code", "red")
         return None
-    tokens = request_platform_oauth_token(session, code, code_verifier)
+    tokens = _exchange_oauth_token(code, code_verifier)
     if not tokens or not tokens.get("access_token"):
-        log("[relogin] 重登 token 换取失败：/api/accounts/oauth/token 返回异常", "red")
+        log("[relogin] 重登 token 换取失败：/oauth/token 返回异常", "red")
         return None
-    id_payload = AccountService._decode_jwt_payload(str(tokens.get("id_token") or ""))
-    if not id_payload:
-        id_payload = AccountService._decode_jwt_payload(str(tokens.get("access_token") or ""))
-    email = str((id_payload or {}).get("email") or "").strip()
-    return {"email": email, "access_token": str(tokens.get("access_token") or "").strip(), "refresh_token": str(tokens.get("refresh_token") or "").strip(), "id_token": str(tokens.get("id_token") or "").strip()}
+    return tokens
 
 
 _relogin_sessions: dict[str, dict] = {}
@@ -790,11 +803,13 @@ def relogin_submit_otp(session_id: str, code: str) -> dict:
     try:
         resp, error = validate_otp(session, device_id, code)
         if resp is None or resp.status_code != 200:
+            log(f"[relogin] OTP 验证失败: status={getattr(resp, 'status_code', 'none')}, error={error}", "red")
             raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}")
         body = _response_json(resp)
         continue_url = str(body.get("continue_url") or "").strip()
         if not continue_url:
             continue_url = f"{auth_base}/sign-in-with-chatgpt/codex/consent"
+        log(f"[relogin] OTP 验证通过，开始换取 token, continue_url={continue_url[:120]}", "yellow")
         tokens = _exchange_relogin_tokens(session, device_id, code_verifier, continue_url)
         if not tokens:
             raise RuntimeError("token换取失败")
