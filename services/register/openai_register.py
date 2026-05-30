@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from curl_cffi import requests
 
-from services.account_service import account_service
+from services.account_service import AccountService, account_service
 from services.register import mail_provider
 
 base_dir = Path(__file__).resolve().parent
@@ -556,3 +556,320 @@ def worker(index: int) -> dict:
         return {"ok": False, "index": index, "error": str(e)}
     finally:
         registrar.close()
+
+
+# ── Relogin (standalone login for existing accounts) ──
+
+def extract_oauth_callback_params_from_consent_session(
+        session: requests.Session, consent_url: str, device_id: str,
+) -> dict[str, str] | None:
+    """Follow the consent/redirect chain to extract OAuth callback params (code, state, scope).
+
+    Tries three strategies (in order):
+    1. Check if consent_url itself is already a callback URL containing code.
+    2. Follow redirect chain manually, checking Location headers for callback params.
+    3. If no redirect yields params, parse the oai-client-auth-session cookie JWT
+       to get workspace_id, then call workspace/select → organization/select
+       to get the final redirect with callback params.
+    """
+    if consent_url.startswith("/"):
+        consent_url = f"{auth_base}{consent_url}"
+
+    # Strategy 0: consent_url may already be a callback URL
+    direct_params = extract_oauth_callback_params_from_url(consent_url)
+    if direct_params:
+        return direct_params
+
+    current_url = consent_url
+    redirect_chain: list[str] = []
+    for _ in range(10):
+        resp = session.get(current_url, headers=navigate_headers, verify=False, timeout=30, allow_redirects=False)
+        redirect_chain.append(f"{current_url[:80]} → {resp.status_code}")
+        for source in (str(resp.url), str(resp.headers.get("Location") or "")):
+            callback_params = extract_oauth_callback_params_from_url(source.strip())
+            if callback_params:
+                return callback_params
+        location = str(resp.headers.get("Location") or "").strip()
+        if resp.status_code not in (301, 302, 303, 307, 308) or not location:
+            break
+        current_url = f"{auth_base}{location}" if location.startswith("/") else location
+
+    # Fallback: parse oai-client-auth-session cookie → workspace/select → org/select
+    raw = session.cookies.get("oai-client-auth-session", domain=".auth.openai.com") or session.cookies.get("oai-client-auth-session")
+    if not raw:
+        log(f"[relogin] OAuth 回调提取失败：缺少 oai-client-auth-session cookie, chain={redirect_chain}", "yellow")
+        return None
+    try:
+        first_part = raw.split(".")[0]
+        padding = 4 - len(first_part) % 4
+        if padding != 4:
+            first_part += "=" * padding
+        payload = json.loads(base64.urlsafe_b64decode(first_part))
+        workspace_id = payload["workspaces"][0]["id"]
+    except Exception as exc:
+        log(f"[relogin] OAuth 回调提取失败：cookie JWT 解析失败: {exc}", "yellow")
+        return None
+    headers = dict(common_headers)
+    headers["referer"] = consent_url
+    headers["oai-device-id"] = device_id
+    headers.update(_make_trace_headers())
+    ws_resp = session.post(
+        f"{auth_base}/api/accounts/workspace/select",
+        json={"workspace_id": workspace_id},
+        headers=headers, verify=False, timeout=30, allow_redirects=False,
+    )
+    callback_params = extract_oauth_callback_params_from_url(str(ws_resp.headers.get("Location") or "").strip())
+    if callback_params:
+        return callback_params
+    ws_data = _response_json(ws_resp)
+    orgs = ((ws_data.get("data") or {}).get("orgs") or []) if isinstance(ws_data, dict) else []
+    if not orgs:
+        log(f"[relogin] OAuth 回调提取失败：workspace/select 返回无 orgs, status={ws_resp.status_code}", "yellow")
+        return None
+    org_id = str((orgs[0] or {}).get("id") or "").strip()
+    project_id = str(((orgs[0] or {}).get("projects") or [{}])[0].get("id") or "").strip()
+    if not org_id:
+        log(f"[relogin] OAuth 回调提取失败：orgs 数据缺少 id", "yellow")
+        return None
+    org_headers = dict(common_headers)
+    org_headers["referer"] = str(ws_data.get("continue_url") or consent_url)
+    org_headers["oai-device-id"] = device_id
+    org_headers.update(_make_trace_headers())
+    body = {"org_id": org_id}
+    if project_id:
+        body["project_id"] = project_id
+    org_resp = session.post(
+        f"{auth_base}/api/accounts/organization/select",
+        json=body, headers=org_headers, verify=False, timeout=30, allow_redirects=False,
+    )
+    result = extract_oauth_callback_params_from_url(str(org_resp.headers.get("Location") or "").strip())
+    if not result:
+        log(f"[relogin] OAuth 回调提取失败：organization/select 返回无 callback, status={org_resp.status_code}", "yellow")
+    return result
+
+
+def _exchange_relogin_tokens(
+        session: requests.Session, device_id: str, code_verifier: str, consent_url: str,
+) -> dict | None:
+    """Extract callback params from consent session, then exchange code for tokens.
+
+    Prefers direct extraction from consent_url (like registration flow), falling back
+    to the consent redirect chain + cookie JWT approach. Uses request_platform_oauth_token
+    (curl_cffi + JSON to /api/accounts/oauth/token) for the actual token exchange.
+    """
+    # Fast path: consent_url may already contain code (same pattern as _create_account)
+    direct_params = extract_oauth_callback_params_from_url(consent_url)
+    code = str((direct_params or {}).get("code") or "").strip() if direct_params else ""
+
+    # Slow path: follow consent session redirects
+    if not code:
+        callback_params = extract_oauth_callback_params_from_consent_session(session, consent_url, device_id)
+        if not callback_params:
+            log("[relogin] 重登 token 换取失败：无法提取 OAuth 回调参数", "red")
+            return None
+        code = str(callback_params.get("code") or "").strip()
+
+    if not code:
+        log("[relogin] 重登 token 换取失败：回调参数中缺少 code", "red")
+        return None
+    tokens = request_platform_oauth_token(session, code, code_verifier)
+    if not tokens or not tokens.get("access_token"):
+        log("[relogin] 重登 token 换取失败：/api/accounts/oauth/token 返回异常", "red")
+        return None
+    id_payload = AccountService._decode_jwt_payload(str(tokens.get("id_token") or ""))
+    if not id_payload:
+        id_payload = AccountService._decode_jwt_payload(str(tokens.get("access_token") or ""))
+    email = str((id_payload or {}).get("email") or "").strip()
+    return {
+        "email": email,
+        "access_token": str(tokens.get("access_token") or "").strip(),
+        "refresh_token": str(tokens.get("refresh_token") or "").strip(),
+        "id_token": str(tokens.get("id_token") or "").strip(),
+    }
+
+
+_relogin_sessions: dict[str, dict] = {}
+_relogin_lock = threading.Lock()
+
+
+def _cleanup_expired_sessions() -> None:
+    now = time.time()
+    with _relogin_lock:
+        expired = [k for k, v in _relogin_sessions.items() if v.get("expires_at", 0) < now]
+        for k in expired:
+            s = _relogin_sessions.pop(k, None)
+            if s:
+                try:
+                    s["session"].close()
+                except Exception:
+                    pass
+
+
+def relogin_and_get_tokens(proxy: str, email: str, password: str) -> dict:
+    """Password-based relogin. Returns tokens dict, or {"otp_required": True, "session_id": str}."""
+    log(f"[relogin] 重登开始（密码模式）: {email}")
+    session = create_session(proxy)
+    device_id = str(uuid.uuid4())
+    code_verifier, code_challenge = _generate_pkce()
+    session.cookies.set("oai-did", device_id, domain=".auth.openai.com")
+    session.cookies.set("oai-did", device_id, domain="auth.openai.com")
+    _keep_session = False
+    try:
+        params = {
+            "issuer": auth_base,
+            "client_id": platform_oauth_client_id,
+            "audience": platform_oauth_audience,
+            "redirect_uri": platform_oauth_redirect_uri,
+            "device_id": device_id,
+            "screen_hint": "login_or_signup",
+            "max_age": "0",
+            "login_hint": email,
+            "scope": "openid profile email offline_access",
+            "response_type": "code",
+            "response_mode": "query",
+            "state": secrets.token_urlsafe(32),
+            "nonce": secrets.token_urlsafe(32),
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "auth0Client": platform_auth0_client,
+        }
+        nav_h = dict(navigate_headers)
+        nav_h["referer"] = f"{platform_base}/"
+        resp, error = request_with_local_retry(session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=nav_h, allow_redirects=False, verify=False)
+        if resp is None:
+            raise RuntimeError(error or "relogin_authorize_failed")
+        if resp.status_code in (302, 303, 307, 308):
+            location = str(resp.headers.get("Location") or "").strip()
+            if location:
+                login_url = f"{auth_base}{location}" if location.startswith("/") else location
+                request_with_local_retry(session, "get", login_url, headers=dict(navigate_headers), allow_redirects=False, verify=False)
+        jh = dict(common_headers)
+        jh["referer"] = f"{auth_base}/log-in/password"
+        jh["oai-device-id"] = device_id
+        jh.update(_make_trace_headers())
+        jh["openai-sentinel-token"] = build_sentinel_token(session, device_id, "password_verify")
+        resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/password/verify", json={"password": password}, headers=jh, allow_redirects=False, verify=False)
+        if resp is None or resp.status_code != 200:
+            body = resp.text[:500] if resp is not None else ""
+            raise RuntimeError(error or f"password_verify_http_{getattr(resp, 'status_code', 'unknown')}{' body:' + body if body else ''}")
+        payload = _response_json(resp)
+        continue_url = str(payload.get("continue_url") or "").strip()
+        page_type = str(((payload.get("page") or {}).get("type")) or "")
+        if page_type == "email_otp_verification" or "email-verification" in continue_url or "email-otp" in continue_url:
+            otp_send_h = dict(navigate_headers)
+            otp_send_h["referer"] = f"{auth_base}/log-in/password"
+            otp_send_h["oai-device-id"] = device_id
+            otp_send_h.update(_make_trace_headers())
+            send_resp, send_err = request_with_local_retry(session, "get", f"{auth_base}/api/accounts/email-otp/send", headers=otp_send_h, allow_redirects=True, verify=False)
+            send_status = getattr(send_resp, "status_code", None)
+            if send_resp is None or send_status not in (200, 302):
+                raise RuntimeError(f"send_otp_http_{send_status}: {send_err}")
+            _cleanup_expired_sessions()
+            session_id = secrets.token_urlsafe(16)
+            with _relogin_lock:
+                _relogin_sessions[session_id] = {
+                    "session": session,
+                    "device_id": device_id,
+                    "code_verifier": code_verifier,
+                    "expires_at": time.time() + 300,
+                }
+            _keep_session = True
+            return {"otp_required": True, "session_id": session_id}
+        if not continue_url:
+            continue_url = f"{auth_base}/sign-in-with-chatgpt/codex/consent"
+        tokens = _exchange_relogin_tokens(session, device_id, code_verifier, continue_url)
+        if not tokens:
+            raise RuntimeError("relogin_exchange_failed")
+        log(f"[relogin] 重登成功（密码模式）: {email}", "green")
+        return tokens
+    finally:
+        if not _keep_session:
+            session.close()
+
+
+def relogin_send_otp(proxy: str, email: str) -> str:
+    """Send OTP for passwordless login. Returns session_id."""
+    log(f"[relogin] 重登 OTP 发送开始: {email}")
+    _cleanup_expired_sessions()
+    session = create_session(proxy)
+    device_id = str(uuid.uuid4())
+    code_verifier, code_challenge = _generate_pkce()
+    session.cookies.set("oai-did", device_id, domain=".auth.openai.com")
+    session.cookies.set("oai-did", device_id, domain="auth.openai.com")
+    try:
+        params = {
+            "issuer": auth_base,
+            "client_id": platform_oauth_client_id,
+            "audience": platform_oauth_audience,
+            "redirect_uri": platform_oauth_redirect_uri,
+            "device_id": device_id,
+            "screen_hint": "login_or_signup",
+            "max_age": "0",
+            "login_hint": email,
+            "scope": "openid profile email offline_access",
+            "response_type": "code",
+            "response_mode": "query",
+            "state": secrets.token_urlsafe(32),
+            "nonce": secrets.token_urlsafe(32),
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "auth0Client": platform_auth0_client,
+        }
+        nav_h = dict(navigate_headers)
+        nav_h["referer"] = f"{platform_base}/"
+        resp, error = request_with_local_retry(session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=nav_h, allow_redirects=False, verify=False)
+        if resp is None:
+            raise RuntimeError(error or "relogin_authorize_failed")
+        if resp.status_code in (302, 303, 307, 308):
+            location = str(resp.headers.get("Location") or "").strip()
+            if location:
+                login_url = f"{auth_base}{location}" if location.startswith("/") else location
+                request_with_local_retry(session, "get", login_url, headers=dict(navigate_headers), allow_redirects=False, verify=False)
+        otp_h = dict(navigate_headers)
+        otp_h["referer"] = f"{auth_base}/log-in/password"
+        otp_h["oai-device-id"] = device_id
+        otp_h.update(_make_trace_headers())
+        resp, error = request_with_local_retry(session, "get", f"{auth_base}/api/accounts/email-otp/send", headers=otp_h, allow_redirects=True, verify=False)
+        if resp is None or resp.status_code not in (200, 302):
+            raise RuntimeError(error or f"send_otp_http_{getattr(resp, 'status_code', 'unknown')}")
+        session_id = secrets.token_urlsafe(16)
+        with _relogin_lock:
+            _relogin_sessions[session_id] = {
+                "session": session,
+                "device_id": device_id,
+                "code_verifier": code_verifier,
+                "expires_at": time.time() + 300,
+            }
+        log(f"[relogin] 重登 OTP 已发送: {email}", "green")
+        return session_id
+    except Exception as exc:
+        session.close()
+        log(f"[relogin] 重登 OTP 发送失败: {email}, error={exc}", "red")
+        raise
+
+
+def relogin_submit_otp(session_id: str, code: str) -> dict:
+    """Validate OTP code and exchange for OAuth tokens."""
+    _cleanup_expired_sessions()
+    with _relogin_lock:
+        state = _relogin_sessions.pop(session_id, None)
+    if state is None:
+        raise RuntimeError("验证码会话已过期，请重新尝试")
+    session = state["session"]
+    device_id = state["device_id"]
+    code_verifier = state["code_verifier"]
+    try:
+        resp, error = validate_otp(session, device_id, code)
+        if resp is None or resp.status_code != 200:
+            raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}")
+        body = _response_json(resp)
+        continue_url = str(body.get("continue_url") or "").strip()
+        if not continue_url:
+            continue_url = f"{auth_base}/sign-in-with-chatgpt/codex/consent"
+        tokens = _exchange_relogin_tokens(session, device_id, code_verifier, continue_url)
+        if not tokens:
+            raise RuntimeError("token换取失败")
+        log(f"[relogin] 重登成功（OTP 模式）: {tokens.get('email', '')}", "green")
+        return tokens
+    finally:
+        session.close()

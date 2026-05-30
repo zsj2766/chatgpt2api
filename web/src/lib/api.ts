@@ -1,7 +1,7 @@
 import { httpRequest, request } from "@/lib/request";
 
 export type AccountType = string;
-export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
+export type AccountStatus = "正常" | "限流" | "异常" | "禁用" | "过期";
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
 export type ImageStorageMode = "local" | "webdav" | "both";
@@ -36,6 +36,11 @@ export type Account = {
   fail: number;
   last_used_at?: string | null;
   proxy?: string | null;
+  password?: string | null;
+  refresh_token?: string | null;
+  refresh_token_expires_at?: number | null;
+  expires_at?: number | null;
+  last_refreshed_at?: string | null;
 };
 
 export type AccountImportPayload = {
@@ -322,6 +327,36 @@ export async function finishOAuthLogin(sessionId: string, callback: string) {
   return httpRequest<AccountMutationResponse>("/api/accounts/oauth/finish", {
     method: "POST",
     body: { session_id: sessionId, callback },
+  });
+}
+
+export async function importAccounts(csvContent: string) {
+  return httpRequest<AccountMutationResponse>("/api/accounts/import", {
+    method: "POST",
+    body: { csv_content: csvContent },
+  });
+}
+
+export type ReloginResponse = {
+  otp_required?: boolean;
+  session_id?: string;
+  added?: number;
+  skipped?: number;
+  refreshed?: number;
+  errors?: Array<{ token: string; error: string }>;
+  items: Account[];
+};
+
+export async function reloginAccount(params: {
+  access_token?: string;
+  email?: string;
+  password?: string;
+  session_id?: string;
+  code?: string;
+}) {
+  return httpRequest<ReloginResponse>("/api/accounts/relogin", {
+    method: "POST",
+    body: params,
   });
 }
 

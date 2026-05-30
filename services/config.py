@@ -261,6 +261,20 @@ class ConfigStore:
             return 5
 
     @property
+    def token_refresh_interval_minute(self) -> int:
+        try:
+            return int(self.data.get("token_refresh_interval_minute", 10))
+        except (TypeError, ValueError):
+            return 10
+
+    @property
+    def token_refresh_before_expiry_seconds(self) -> int:
+        try:
+            return int(self.data.get("token_refresh_before_expiry_seconds", 300))
+        except (TypeError, ValueError):
+            return 300
+
+    @property
     def image_retention_days(self) -> int:
         try:
             return max(1, int(self.data.get("image_retention_days", 30)))
@@ -379,6 +393,8 @@ class ConfigStore:
     def get(self) -> dict[str, object]:
         data = dict(self.data)
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
+        data["token_refresh_interval_minute"] = self.token_refresh_interval_minute
+        data["token_refresh_before_expiry_seconds"] = self.token_refresh_before_expiry_seconds
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs

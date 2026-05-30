@@ -9,6 +9,7 @@ import {
   ChevronRight,
   CircleAlert,
   CircleOff,
+  Clock,
   Copy,
   Download,
   Link2,
@@ -62,6 +63,7 @@ const accountStatusOptions: { label: string; value: AccountStatus | "all" }[] = 
   { label: "正常", value: "正常" },
   { label: "限流", value: "限流" },
   { label: "异常", value: "异常" },
+  { label: "过期", value: "过期" },
   { label: "禁用", value: "禁用" },
 ];
 
@@ -75,6 +77,7 @@ const statusMeta: Record<
   正常: { icon: CheckCircle2, badge: "success" },
   限流: { icon: CircleAlert, badge: "warning" },
   异常: { icon: CircleOff, badge: "danger" },
+  过期: { icon: Clock, badge: "outline" },
   禁用: { icon: Ban, badge: "secondary" },
 };
 
