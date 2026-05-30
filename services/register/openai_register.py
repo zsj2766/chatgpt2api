@@ -14,7 +14,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from curl_cffi import requests
+import requests
+import urllib3
+from curl_cffi import requests as curl_requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from services.account_service import AccountService, account_service
 from services.register import mail_provider
@@ -302,11 +308,23 @@ def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -
     return json.dumps({"p": p_value, "t": "", "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
 
 
+def _is_socks_proxy(proxy: str) -> bool:
+    candidate = str(proxy or "").strip().lower()
+    return candidate.startswith("socks5://") or candidate.startswith("socks5h://")
+
+
 def create_session(proxy: str = "") -> Any:
-    kwargs = {"impersonate": "chrome", "verify": False}
+    if _is_socks_proxy(proxy):
+        return curl_requests.Session(impersonate="chrome136", verify=False, proxy=proxy)
+    session = requests.Session()
+    retry = Retry(total=2, connect=2, read=2, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.verify = False
     if proxy:
-        kwargs["proxy"] = proxy
-    return requests.Session(**kwargs)
+        session.proxies.update({"http": proxy, "https": proxy})
+    return session
 
 
 def request_with_local_retry(session: requests.Session, method: str, url: str, retry_attempts: int = 3, **kwargs):
