@@ -23,6 +23,7 @@ from urllib3.util.retry import Retry
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from services.account_service import AccountService, account_service
+from services.register import is_socks_proxy
 from services.register import mail_provider
 
 base_dir = Path(__file__).resolve().parent
@@ -308,13 +309,8 @@ def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -
     return json.dumps({"p": p_value, "t": "", "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
 
 
-def _is_socks_proxy(proxy: str) -> bool:
-    candidate = str(proxy or "").strip().lower()
-    return candidate.startswith("socks5://") or candidate.startswith("socks5h://")
-
-
 def create_session(proxy: str = "") -> Any:
-    if _is_socks_proxy(proxy):
+    if is_socks_proxy(proxy):
         return curl_requests.Session(impersonate="chrome136", verify=False, proxy=proxy)
     session = requests.Session()
     retry = Retry(total=2, connect=2, read=2, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))

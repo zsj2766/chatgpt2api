@@ -22,6 +22,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 from services.config import DATA_DIR
+from services.register import is_socks_proxy
 
 DDG_ALIASES_FILE = DATA_DIR / "ddg_aliases.json"
 _ddg_aliases_lock = Lock()
@@ -111,7 +112,7 @@ def _normalize_string_list(value: Any) -> list[str]:
 
 def _create_session(conf: dict):
     proxy = str(conf.get("proxy") or "").strip()
-    if proxy and (proxy.lower().startswith("socks5://") or proxy.lower().startswith("socks5h://")):
+    if is_socks_proxy(proxy):
         return curl_requests.Session(impersonate="chrome136", verify=False, proxy=proxy)
     session = requests.Session()
     retry = Retry(total=2, connect=2, read=2, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
