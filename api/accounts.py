@@ -118,6 +118,18 @@ class OAuthLoginFinishRequest(BaseModel):
     callback: str = ""
 
 
+class AccountImportRequest(BaseModel):
+    csv_content: str = ""
+
+
+class AccountReloginRequest(BaseModel):
+    access_token: str = ""
+    email: str = ""
+    password: str = ""
+    session_id: str = ""
+    code: str = ""
+
+
 def _account_payload_token(item: dict[str, Any]) -> str:
     return str(item.get("access_token") or item.get("accessToken") or "").strip()
 
@@ -294,6 +306,96 @@ def create_router() -> APIRouter:
         if account is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
         return {"item": account, "items": account_service.list_accounts()}
+
+    @router.post("/api/accounts/import")
+    async def import_accounts(body: AccountImportRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        csv_content = str(body.csv_content or "").strip()
+        if not csv_content:
+            raise HTTPException(status_code=400, detail={"error": "csv_content is required"})
+        import csv as csv_mod
+        import io as _io
+        reader = csv_mod.DictReader(_io.StringIO(csv_content))
+        items = []
+        for row in reader:
+            item = {str(k).strip(): str(v).strip() for k, v in row.items() if k and v}
+            if item.get("access_token") or item.get("accessToken"):
+                items.append(item)
+        if not items:
+            raise HTTPException(status_code=400, detail={"error": "CSV 中没有有效账号"})
+        add_result = account_service.add_account_items(items)
+        tokens = [account_service._account_payload_token(item) for item in items]
+        tokens = [t for t in tokens if t]
+        refresh_result = account_service.refresh_accounts(tokens) if tokens else {"refreshed": 0, "errors": []}
+        return {
+            **add_result,
+            "refreshed": refresh_result.get("refreshed", 0),
+            "errors": refresh_result.get("errors", []),
+            "items": refresh_result.get("items", add_result.get("items", [])),
+        }
+
+    @router.post("/api/accounts/relogin")
+    async def relogin_account(body: AccountReloginRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        from services.config import config as cfg
+        from services.register.openai_register import (
+            relogin_and_get_tokens,
+            relogin_send_otp,
+            relogin_submit_otp,
+        )
+
+        try:
+            if body.session_id and body.code:
+                tokens = relogin_submit_otp(body.session_id, body.code)
+                if not tokens.get("access_token"):
+                    raise HTTPException(status_code=400, detail={"error": "重登 token 换取失败"})
+                payload = {
+                    "access_token": tokens["access_token"],
+                    "refresh_token": tokens.get("refresh_token", ""),
+                    "id_token": tokens.get("id_token", ""),
+                    "email": tokens.get("email", body.email),
+                    "password": body.password,
+                }
+                add_result = account_service.add_account_items([payload])
+                refresh_result = account_service.refresh_accounts([tokens["access_token"]])
+                return {
+                    **add_result,
+                    "refreshed": refresh_result.get("refreshed", 0),
+                    "errors": refresh_result.get("errors", []),
+                    "items": refresh_result.get("items", add_result.get("items", [])),
+                }
+
+            if body.email and body.password:
+                result = relogin_and_get_tokens(cfg.get_proxy_settings(), body.email, body.password)
+                if result.get("otp_required"):
+                    return {"otp_required": True, "session_id": result["session_id"]}
+                if not result.get("access_token"):
+                    raise HTTPException(status_code=400, detail={"error": "重登 token 换取失败"})
+                payload = {
+                    "access_token": result["access_token"],
+                    "refresh_token": result.get("refresh_token", ""),
+                    "id_token": result.get("id_token", ""),
+                    "email": body.email,
+                    "password": body.password,
+                }
+                add_result = account_service.add_account_items([payload])
+                refresh_result = account_service.refresh_accounts([result["access_token"]])
+                return {
+                    **add_result,
+                    "refreshed": refresh_result.get("refreshed", 0),
+                    "errors": refresh_result.get("errors", []),
+                    "items": refresh_result.get("items", add_result.get("items", [])),
+                }
+
+            if body.email:
+                session_id = relogin_send_otp(cfg.get_proxy_settings(), body.email)
+                return {"otp_required": True, "session_id": session_id}
+
+            raise HTTPException(status_code=400, detail={"error": "需要提供 email 或 session_id+code"})
+        except HTTPException:
+            raise
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.post("/api/accounts/oauth/start")
     async def start_oauth_login(

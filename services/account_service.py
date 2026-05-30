@@ -120,7 +120,7 @@ class AccountService:
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):
             return False
-        if account.get("status") in {"禁用", "限流", "异常"}:
+        if account.get("status") in {"禁用", "限流", "异常", "过期"}:
             return False
         if bool(account.get("image_quota_unknown")):
             return True
@@ -601,7 +601,7 @@ class AccountService:
             candidates = [
                 token
                 for account in self._accounts.values()
-                if account.get("status") not in {"禁用", "异常"}
+                if account.get("status") not in {"禁用", "异常", "过期"}
                    and (token := account.get("access_token") or "")
                    and token not in excluded
             ]

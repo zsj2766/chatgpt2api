@@ -7,6 +7,7 @@ import {
   Copy,
   ExternalLink,
   FileJson,
+  FileSpreadsheet,
   FileText,
   Files,
   KeyRound,
@@ -31,6 +32,7 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   createAccounts,
   finishOAuthLogin,
+  importAccounts,
   startOAuthLogin,
   type Account,
   type AccountImportPayload,
@@ -38,7 +40,7 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-type ImportMethod = "menu" | "token" | "session" | "codex-auth" | "cpa" | "oauth";
+type ImportMethod = "menu" | "token" | "session" | "codex-auth" | "cpa" | "oauth" | "csv";
 
 type AccountImportDialogProps = {
   disabled?: boolean;
@@ -162,6 +164,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   const [tokenInput, setTokenInput] = useState("");
   const [sessionInput, setSessionInput] = useState("");
   const [codexAuthInput, setCodexAuthInput] = useState("");
+  const [csvInput, setCsvInput] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [pendingCpaImport, setPendingCpaImport] = useState<PendingCpaImport | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -172,12 +175,14 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
 
   const txtInputRef = useRef<HTMLInputElement | null>(null);
   const cpaInputRef = useRef<HTMLInputElement | null>(null);
+  const csvInputRef = useRef<HTMLInputElement | null>(null);
 
   const resetState = () => {
     setMethod("menu");
     setTokenInput("");
     setSessionInput("");
     setCodexAuthInput("");
+    setCsvInput("");
     setPendingCpaImport(null);
     setConfirmOpen(false);
     setOauthEmailHint("");
@@ -416,6 +421,38 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       const message = error instanceof Error ? error.message : "读取 CPA JSON 文件失败";
       toast.error(message);
     }
+  };
+
+  const handleCsvSelected = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const content = await readFileAsText(file);
+      setCsvInput(content);
+      toast.success(`已读取 ${file.name}`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "读取 CSV 文件失败");
+    }
+  };
+
+  const handleImportCsv = async () => {
+    const content = csvInput.trim();
+    if (!content) { toast.error("请先提供 CSV 内容"); return; }
+    setIsSubmitting(true);
+    try {
+      const data = await importAccounts(content);
+      onImported(data.items);
+      setOpen(false);
+      resetState();
+      if ((data.errors?.length ?? 0) > 0) {
+        toast.error(`CSV 导入完成，新增 ${data.added ?? 0} 个，失败 ${data.errors?.length ?? 0} 个`);
+      } else {
+        toast.success(`CSV 导入完成，新增 ${data.added ?? 0} 个，跳过 ${data.skipped ?? 0} 个`);
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "CSV 导入失败");
+    } finally { setIsSubmitting(false); }
   };
 
   const renderMethodBody = () => {
@@ -686,6 +723,32 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       );
     }
 
+    if (method === "csv") {
+      return (
+        <div className="space-y-4">
+          <button type="button" onClick={() => setMethod("menu")} className="inline-flex items-center gap-1 text-sm text-stone-500 transition hover:text-stone-800">
+            <ArrowLeft className="size-4" /> 返回导入方式
+          </button>
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-stone-700">CSV 内容</label>
+            <Textarea placeholder="粘贴 CSV 内容，首行为表头（需含 access_token 列）..." value={csvInput} onChange={(event) => setCsvInput(event.target.value)} className="min-h-56 resize-none rounded-xl border-stone-200 font-mono text-xs" />
+          </div>
+          <div className="rounded-2xl border border-dashed border-stone-200 bg-stone-50 p-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="space-y-1">
+                <div className="text-sm font-medium text-stone-800">从 CSV 文件导入</div>
+                <div className="text-sm leading-6 text-stone-500">首行为表头，需包含 access_token 列。</div>
+              </div>
+              <Button type="button" variant="outline" className="rounded-xl border-stone-200 bg-white" onClick={() => csvInputRef.current?.click()} disabled={isSubmitting}>
+                <FileSpreadsheet className="size-4" /> 选择 CSV
+              </Button>
+            </div>
+          </div>
+          <input ref={csvInputRef} type="file" accept=".csv,text/csv" className="hidden" onChange={(event) => void handleCsvSelected(event)} />
+        </div>
+      );
+    }
+
     return (
       <div className="space-y-3">
         <MethodCard
@@ -711,6 +774,12 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
           description="粘贴 Codex 认证 JSON，导入后账号来源标记为 codex。"
           icon={FileJson}
           onClick={() => setMethod("codex-auth")}
+        />
+        <MethodCard
+          title="导入 CSV"
+          description="粘贴或上传 CSV 文件，首行为表头，需含 access_token 列。"
+          icon={FileSpreadsheet}
+          onClick={() => setMethod("csv")}
         />
         <MethodCard
           title="导入 CPA JSON 文件"
@@ -766,6 +835,8 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                     ? "导入 Session JSON"
                     : method === "codex-auth"
                       ? "导入 Codex 认证 JSON"
+                    : method === "csv"
+                      ? "导入 CSV"
                     : method === "oauth"
                       ? "OAuth 登录已有账号"
                       : "导入 CPA JSON"}
@@ -779,6 +850,8 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
                     ? "粘贴完整 Session JSON，系统会自动提取 accessToken。"
                     : method === "codex-auth"
                       ? "粘贴 Codex 认证 JSON，系统会按 codex 来源导入。"
+                    : method === "csv"
+                      ? "粘贴或上传 CSV 文件，首行为表头，需含 access_token 列。"
                     : method === "oauth"
                       ? "用浏览器跑一遍 OpenAI 标准 OAuth，拿回 refresh_token 后系统会自动续期。"
                       : "支持一次读取多个本地 JSON 文件，并在提交前做数量确认。"}
@@ -824,6 +897,11 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
               >
                 {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null}
                 导入 JSON
+              </Button>
+            ) : null}
+            {method === "csv" ? (
+              <Button className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800" onClick={() => void handleImportCsv()} disabled={footerDisabled || !csvInput.trim()}>
+                {isSubmitting ? <LoaderCircle className="size-4 animate-spin" /> : null} 导入 CSV
               </Button>
             ) : null}
             {method === "oauth" ? (

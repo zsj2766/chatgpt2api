@@ -5,6 +5,7 @@ import type { ComponentProps } from "react";
 import {
   Ban,
   CheckCircle2,
+  Clock,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
@@ -63,6 +64,7 @@ const accountStatusOptions: { label: string; value: AccountStatus | "all" }[] = 
   { label: "限流", value: "限流" },
   { label: "异常", value: "异常" },
   { label: "禁用", value: "禁用" },
+  { label: "过期", value: "过期" },
 ];
 
 const statusMeta: Record<
@@ -76,6 +78,7 @@ const statusMeta: Record<
   限流: { icon: CircleAlert, badge: "warning" },
   异常: { icon: CircleOff, badge: "danger" },
   禁用: { icon: Ban, badge: "secondary" },
+  过期: { icon: Clock, badge: "outline" },
 };
 
 const metricCards = [
