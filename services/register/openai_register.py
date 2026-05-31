@@ -22,7 +22,8 @@ from urllib3.util.retry import Retry
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-from services.account_service import AccountService, account_service
+from services.account_service import account_service
+from services.log_service import LOG_TYPE_REGISTER, log_service
 from services.register import is_socks_proxy
 from services.register import mail_provider
 
@@ -380,6 +381,7 @@ def _exchange_oauth_token(code: str, code_verifier: str) -> dict | None:
         data = _response_json(resp)
         if resp.status_code != 200 or not data.get("access_token") or not data.get("refresh_token") or not data.get("id_token"):
             log(f"[exchange] /oauth/token 失败: status={resp.status_code}, body={json.dumps(data, ensure_ascii=False)[:300]}", "red")
+            log_service.add(LOG_TYPE_REGISTER, "token 交换失败", {"status": resp.status_code, "body": json.dumps(data, ensure_ascii=False)[:300]})
             return None
         payload = _decode_jwt_payload(str(data.get("id_token") or "")) or _decode_jwt_payload(str(data.get("access_token") or ""))
         refresh_token_expires_at = None
@@ -401,6 +403,7 @@ def _exchange_oauth_token(code: str, code_verifier: str) -> dict | None:
             refresh_token_expires_at = int(time.time()) + 86400 * 30
         email = str(payload.get("email") or "").strip()
         log(f"[exchange] token 交换成功: {email}, rt_expires_in={rt_expires_in}", "green")
+        log_service.add(LOG_TYPE_REGISTER, "token 交换成功", {"email": email, "rt_expires_in": rt_expires_in})
         return {
             "email": email,
             "access_token": str(data.get("access_token") or "").strip(),
@@ -577,6 +580,7 @@ def worker(index: int) -> dict:
             stats["success"] += 1
             avg = (time.time() - stats["start_time"]) / stats["success"]
         log(f'{result["email"]} 注册成功，本次耗时{cost:.1f}s，全局平均每个号注册耗时{avg:.1f}s', "green")
+        log_service.add(LOG_TYPE_REGISTER, "注册成功", {"email": result["email"], "cost_seconds": round(cost, 1), "avg_seconds": round(avg, 1)})
         return {"ok": True, "index": index, "result": result}
     except Exception as e:
         cost = time.time() - start
@@ -584,6 +588,7 @@ def worker(index: int) -> dict:
             stats["done"] += 1
             stats["fail"] += 1
         log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {e}", "red")
+        log_service.add(LOG_TYPE_REGISTER, "注册失败", {"index": index, "cost_seconds": round(cost, 1), "error": str(e)[:300]})
         return {"ok": False, "index": index, "error": str(e)}
     finally:
         registrar.close()
@@ -665,14 +670,17 @@ def _exchange_relogin_tokens(session: requests.Session, device_id: str, code_ver
         callback_params = extract_oauth_callback_params_from_consent_session(session, consent_url, device_id)
         if not callback_params:
             log(f"[relogin] 重登 token 换取失败：无法提取 OAuth 回调参数, consent_url={consent_url[:120]}", "red")
+            log_service.add(LOG_TYPE_REGISTER, "重登 token 换取失败", {"reason": "无法提取 OAuth 回调参数", "consent_url": consent_url[:120]})
             return None
         code = str(callback_params.get("code") or "").strip()
     if not code:
         log("[relogin] 重登 token 换取失败：回调参数中缺少 code", "red")
+        log_service.add(LOG_TYPE_REGISTER, "重登 token 换取失败", {"reason": "回调参数中缺少 code"})
         return None
     tokens = _exchange_oauth_token(code, code_verifier)
     if not tokens or not tokens.get("access_token"):
         log("[relogin] 重登 token 换取失败：/oauth/token 返回异常", "red")
+        log_service.add(LOG_TYPE_REGISTER, "重登 token 换取失败", {"reason": "/oauth/token 返回异常"})
         return None
     return tokens
 
@@ -696,6 +704,7 @@ def _cleanup_expired_sessions() -> None:
 
 def relogin_and_get_tokens(proxy: str, email: str, password: str) -> dict:
     log(f"[relogin] 重登开始（密码模式）: {email}")
+    log_service.add(LOG_TYPE_REGISTER, "重登开始（密码模式）", {"email": email})
     session = create_session(proxy)
     device_id = str(uuid.uuid4())
     code_verifier, code_challenge = _generate_pkce()
@@ -722,6 +731,7 @@ def relogin_and_get_tokens(proxy: str, email: str, password: str) -> dict:
         resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/password/verify", json={"password": password}, headers=jh, allow_redirects=False, verify=False)
         if resp is None or resp.status_code != 200:
             body = resp.text[:500] if resp is not None else ""
+            log_service.add(LOG_TYPE_REGISTER, "重登密码验证失败", {"email": email, "status": getattr(resp, "status_code", "none"), "body": body[:300]})
             raise RuntimeError(error or f"password_verify_http_{getattr(resp, 'status_code', 'unknown')}{' body:' + body if body else ''}")
         payload = _response_json(resp)
         continue_url = str(payload.get("continue_url") or "").strip()
@@ -747,6 +757,7 @@ def relogin_and_get_tokens(proxy: str, email: str, password: str) -> dict:
         if not tokens:
             raise RuntimeError("relogin_exchange_failed")
         log(f"[relogin] 重登成功（密码模式）: {email}", "green")
+        log_service.add(LOG_TYPE_REGISTER, "重登成功（密码模式）", {"email": email})
         return tokens
     finally:
         if not _keep_session:
@@ -755,6 +766,7 @@ def relogin_and_get_tokens(proxy: str, email: str, password: str) -> dict:
 
 def relogin_send_otp(proxy: str, email: str) -> str:
     log(f"[relogin] 重登 OTP 发送开始: {email}")
+    log_service.add(LOG_TYPE_REGISTER, "重登 OTP 发送开始", {"email": email})
     _cleanup_expired_sessions()
     session = create_session(proxy)
     device_id = str(uuid.uuid4())
@@ -784,10 +796,12 @@ def relogin_send_otp(proxy: str, email: str) -> str:
         with _relogin_lock:
             _relogin_sessions[session_id] = {"session": session, "device_id": device_id, "code_verifier": code_verifier, "expires_at": time.time() + 300}
         log(f"[relogin] 重登 OTP 已发送: {email}", "green")
+        log_service.add(LOG_TYPE_REGISTER, "重登 OTP 已发送", {"email": email})
         return session_id
     except Exception as exc:
         session.close()
         log(f"[relogin] 重登 OTP 发送失败: {email}, error={exc}", "red")
+        log_service.add(LOG_TYPE_REGISTER, "重登 OTP 发送失败", {"email": email, "error": str(exc)})
         raise
 
 
@@ -804,16 +818,19 @@ def relogin_submit_otp(session_id: str, code: str) -> dict:
         resp, error = validate_otp(session, device_id, code)
         if resp is None or resp.status_code != 200:
             log(f"[relogin] OTP 验证失败: status={getattr(resp, 'status_code', 'none')}, error={error}", "red")
+            log_service.add(LOG_TYPE_REGISTER, "重登 OTP 验证失败", {"status": getattr(resp, "status_code", "none"), "error": str(error or "")[:300]})
             raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}")
         body = _response_json(resp)
         continue_url = str(body.get("continue_url") or "").strip()
         if not continue_url:
             continue_url = f"{auth_base}/sign-in-with-chatgpt/codex/consent"
         log(f"[relogin] OTP 验证通过，开始换取 token, continue_url={continue_url[:120]}", "yellow")
+        log_service.add(LOG_TYPE_REGISTER, "重登 OTP 验证通过", {"continue_url": continue_url[:120]})
         tokens = _exchange_relogin_tokens(session, device_id, code_verifier, continue_url)
         if not tokens:
             raise RuntimeError("token换取失败")
         log(f"[relogin] 重登成功（OTP 模式）: {tokens.get('email', '')}", "green")
+        log_service.add(LOG_TYPE_REGISTER, "重登成功（OTP 模式）", {"email": str(tokens.get("email") or "")[:100]})
         return tokens
     finally:
         session.close()

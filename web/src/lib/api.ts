@@ -198,7 +198,7 @@ export type ManagedImage = {
 export type SystemLog = {
   id: string;
   time: string;
-  type: "call" | "account" | string;
+  type: "call" | "account" | "register" | string;
   summary?: string;
   detail?: Record<string, unknown>;
   [key: string]: unknown;

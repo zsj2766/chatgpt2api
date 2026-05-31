@@ -20,11 +20,13 @@ import { useAuthGuard } from "@/lib/use-auth-guard";
 const LogType = {
   Call: "call",
   Account: "account",
+  Register: "register",
 } as const;
 
 const typeLabels: Record<string, string> = {
   [LogType.Call]: "调用日志",
   [LogType.Account]: "账号管理日志",
+  [LogType.Register]: "注册/重登日志",
 };
 
 function getDetailText(item: SystemLog, key: string) {
