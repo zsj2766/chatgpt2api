@@ -383,7 +383,7 @@ def _exchange_oauth_token(code: str, code_verifier: str) -> dict | None:
             log(f"[exchange] /oauth/token 失败: status={resp.status_code}, body={json.dumps(data, ensure_ascii=False)[:300]}", "red")
             log_service.add(LOG_TYPE_REGISTER, "token 交换失败", {"status": resp.status_code, "body": json.dumps(data, ensure_ascii=False)[:300]})
             return None
-        payload = _decode_jwt_payload(str(data.get("id_token") or "")) or _decode_jwt_payload(str(data.get("access_token") or ""))
+        payload = account_service._decode_jwt_payload(str(data.get("id_token") or "")) or account_service._decode_jwt_payload(str(data.get("access_token") or ""))
         refresh_token_expires_at = None
         rt_expires_in = data.get("refresh_token_expires_in")
         if rt_expires_in is not None:
@@ -392,7 +392,7 @@ def _exchange_oauth_token(code: str, code_verifier: str) -> dict | None:
             except (TypeError, ValueError):
                 pass
         if refresh_token_expires_at is None:
-            rt_payload = _decode_jwt_payload(str(data.get("refresh_token") or ""))
+            rt_payload = account_service._decode_jwt_payload(str(data.get("refresh_token") or ""))
             rt_exp = rt_payload.get("exp")
             if rt_exp:
                 try:
