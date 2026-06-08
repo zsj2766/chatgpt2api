@@ -572,8 +572,14 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> str:
+        """从候选池中获取一个可用的图片生图 token。
+
+        基于本地缓存做初筛，然后通过 fetch_remote_info 做远程验证（token 有效性、配额等）。
+        限制最大尝试次数防止 token rotation 导致无限循环。
+        """
+        max_attempts = 20  # 防止无限循环
         attempted_tokens: set[str] = set()
-        while True:
+        for _attempt in range(max_attempts):
             access_token = self._acquire_next_candidate_token(
                 excluded_tokens=attempted_tokens,
                 plan_type=plan_type,
@@ -586,6 +592,11 @@ class AccountService:
             except Exception:
                 self.release_image_slot(access_token)
                 continue
+            # fetch_remote_info 内部可能因 token rotation 导致 access_token 变化，
+            # 把新 token 也加入排除列表，防止重复尝试
+            resolved = str((account or {}).get("access_token") or "")
+            if resolved and resolved != access_token:
+                attempted_tokens.add(resolved)
             if (
                     self._is_image_account_available(account or {})
                     and self._account_matches_plan_type(account or {}, plan_type)
@@ -594,6 +605,10 @@ class AccountService:
             ):
                 return str((account or {}).get("access_token") or access_token)
             self.release_image_slot(access_token)
+        raise RuntimeError(
+            f"no available {plan_type or source_type or ''} image quota (tried {len(attempted_tokens)} tokens)".replace("  ", " ").strip()
+            if plan_type or source_type else f"no available image quota (tried {len(attempted_tokens)} tokens)"
+        )
 
     def get_text_access_token(self, excluded_tokens: set[str] | None = None) -> str:
         excluded = set(excluded_tokens or set())

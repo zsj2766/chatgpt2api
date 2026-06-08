@@ -218,8 +218,12 @@ export type ImageTask = {
   quality?: string;
   created_at: string;
   updated_at: string;
+  conversation_id?: string;
   data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
   error?: string;
+  progress?: string;
+  elapsed_secs?: number;
+  duration_ms?: number;
 };
 
 type ImageTaskListResponse = {
@@ -484,6 +488,13 @@ export async function fetchImageTasks(ids: string[]) {
     params.set("ids", ids.join(","));
   }
   return httpRequest<ImageTaskListResponse>(`/api/image-tasks${params.toString() ? `?${params.toString()}` : ""}`);
+}
+
+export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
+  return httpRequest<ImageTask>(`/api/image-tasks/${encodeURIComponent(taskId)}/resume-poll`, {
+    method: "POST",
+    body: { extra_timeout_secs: extraTimeoutSecs },
+  });
 }
 
 export async function fetchSettingsConfig() {
