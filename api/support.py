@@ -5,14 +5,9 @@ from threading import Event, Thread
 
 from fastapi import HTTPException, Request
 
-import time
-from datetime import datetime
-
 from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config
-from services.log_service import LOG_TYPE_ACCOUNT, log_service
-from utils.helper import anonymize_token
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
@@ -84,112 +79,35 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
     return [sanitized for server in servers if (sanitized := sanitize_sub2api_server(server)) is not None]
 
 
-def start_account_watcher(stop_event: Event) -> Thread:
-    """Unified watcher for account lifecycle: token refresh, rate-limit recovery, and keepalive."""
-    before_expiry = config.token_refresh_before_expiry_seconds
-    max_interval = max(
-        config.token_refresh_interval_minute * 60,
-        config.refresh_account_interval_minute * 60,
-    )
-
-    def _resolve_expires_at(acc: dict) -> int:
-        stored = acc.get("expires_at")
-        if stored is not None:
-            try:
-                return int(stored)
-            except (TypeError, ValueError):
-                pass
-        return account_service._jwt_exp(str(acc.get("access_token") or ""))
-
-    def _parse_restore_at(acc: dict) -> int:
-        raw = acc.get("restore_at") or ""
-        if not raw:
-            return 0
-        try:
-            clean = raw.rstrip("Z")
-            return int(datetime.fromisoformat(clean).timestamp())
-        except (ValueError, TypeError):
-            return 0
-
-    _skip_statuses = {"禁用", "异常", "过期"}
+def start_limited_account_watcher(stop_event: Event) -> Thread:
+    interval_seconds = config.refresh_account_interval_minute * 60
 
     def worker() -> None:
         while not stop_event.is_set():
             try:
-                accounts = account_service.list_accounts()
-                now = int(time.time())
-                nearest_token_event = 0
-                nearest_restore_event = 0
-
-                token_needing_refresh: list[dict] = []
-                limited_needing_refresh: list[str] = []
-
-                for acc in accounts:
-                    status = acc.get("status") or ""
-                    access_token = str(acc.get("access_token") or "").strip()
-                    if not access_token:
-                        continue
-
-                    if status not in _skip_statuses:
-                        exp = _resolve_expires_at(acc)
-                        refresh_token_str = str(acc.get("refresh_token") or "").strip()
-
-                        if exp > 0:
-                            if refresh_token_str:
-                                if nearest_token_event == 0 or exp < nearest_token_event:
-                                    nearest_token_event = exp
-                                if exp - now <= before_expiry:
-                                    token_needing_refresh.append(acc)
-                            elif exp <= now:
-                                account_service.update_account(access_token, {"status": "过期"})
-                                log_service.add(LOG_TYPE_ACCOUNT, "token 已过期且无 refresh_token",
-                                                {"token": anonymize_token(access_token)})
-
-                    if status == "限流":
-                        restore_ts = _parse_restore_at(acc)
-                        if restore_ts > 0:
-                            if nearest_restore_event == 0 or restore_ts < nearest_restore_event:
-                                nearest_restore_event = restore_ts
-                            if restore_ts <= now:
-                                limited_needing_refresh.append(access_token)
-                        else:
-                            if nearest_restore_event == 0:
-                                nearest_restore_event = now + max_interval
-
-                if token_needing_refresh:
-                    refreshed = 0
-                    for acc in token_needing_refresh:
-                        new_token = account_service.refresh_access_token(str(acc.get("access_token") or ""))
-                        if new_token:
-                            refreshed += 1
-                    if refreshed:
-                        log_service.add(LOG_TYPE_ACCOUNT, "token 自动刷新完成", {"refreshed": refreshed})
-                        continue
-
-                if limited_needing_refresh:
-                    result = account_service.refresh_accounts(limited_needing_refresh)
-                    recovered = result.get("refreshed", 0)
-                    log_service.add(LOG_TYPE_ACCOUNT, "限流账号自动刷新",
-                                    {"refreshed": recovered, "count": len(limited_needing_refresh)})
-                    if recovered:
-                        continue
-
+                limited_tokens = account_service.list_limited_tokens()
+                normal_tokens = account_service.list_normal_tokens()
+                expiring_tokens = account_service.list_expiring_access_tokens()
                 keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
+                tokens = list(dict.fromkeys([*limited_tokens, *normal_tokens, *expiring_tokens]))
+                expiring_token_set = set(expiring_tokens)
+                keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
+                if tokens:
+                    print(
+                        "[account-watcher] checking "
+                        f"{len(limited_tokens)} limited accounts, "
+                        f"{len(normal_tokens)} normal accounts, "
+                        f"{len(expiring_tokens)} expiring access tokens"
+                    )
+                    account_service.refresh_accounts(tokens)
                 if keepalive_tokens:
-                    log_service.add(LOG_TYPE_ACCOUNT, "refresh_token keepalive",
-                                    {"count": len(keepalive_tokens)})
-                    account_service.keepalive_refresh_tokens(keepalive_tokens)
-
-                sleep_sec = max_interval
-                if nearest_token_event and nearest_token_event > now:
-                    sleep_sec = min(sleep_sec, max(60, nearest_token_event - now - before_expiry))
-                if nearest_restore_event and nearest_restore_event > now:
-                    sleep_sec = min(sleep_sec, max(60, nearest_restore_event - now))
-                stop_event.wait(sleep_sec)
-
+                    print(f"[account-watcher] keepalive {len(keepalive_tokens)} refresh tokens")
+                    result = account_service.keepalive_refresh_tokens(keepalive_tokens)
+                    if result.get("errors"):
+                        print(f"[account-watcher] keepalive errors: {result['errors']}")
             except Exception as exc:
-                log_service.add(LOG_TYPE_ACCOUNT, "账号调度异常", {"error": str(exc)})
-                stop_event.wait(max_interval)
+                print(f"[account-watcher] fail {exc}")
+            stop_event.wait(interval_seconds)
 
     thread = Thread(target=worker, name="account-watcher", daemon=True)
     thread.start()
