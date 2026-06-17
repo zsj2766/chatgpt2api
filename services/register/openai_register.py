@@ -647,7 +647,7 @@ def extract_oauth_callback_params_from_consent_session(
     org_id = str((orgs[0] or {}).get("id") or "").strip()
     project_id = str(((orgs[0] or {}).get("projects") or [{}])[0].get("id") or "").strip()
     if not org_id:
-        log(f"[relogin] OAuth 回调提取失败：orgs 数据缺少 id", "yellow")
+        log("[relogin] OAuth 回调提取失败：orgs 数据缺少 id", "yellow")
         return None
     org_headers = dict(common_headers)
     org_headers["referer"] = str(ws_data.get("continue_url") or consent_url)

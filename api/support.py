@@ -80,7 +80,8 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
 
 
 def start_limited_account_watcher(stop_event: Event) -> Thread:
-    interval_seconds = config.refresh_account_interval_minute * 60
+    # 下限 60s：配置为 0 会使 wait(0) 立即返回 → 忙等待 CPU 100%
+    interval_seconds = max(60, config.refresh_account_interval_minute * 60)
 
     def worker() -> None:
         while not stop_event.is_set():

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import itertools
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -33,6 +34,7 @@ class LogService:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._write_count = 0
+        self._lock = threading.Lock()
 
     @staticmethod
     def _legacy_id(raw_line: str, line_number: int) -> str:
@@ -74,68 +76,74 @@ class LogService:
             "summary": summary,
             "detail": detail or data,
         }
-        with self.path.open("a", encoding="utf-8") as file:
-            file.write(self._serialize_item(item) + "\n")
-        self._write_count += 1
-        if self._write_count >= self._CHECK_EVERY:
-            self._write_count = 0
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as file:
+                file.write(self._serialize_item(item) + "\n")
+            self._write_count += 1
+            due = self._write_count >= self._CHECK_EVERY
+            if due:
+                self._write_count = 0
+        if due:
             self._maybe_trim()
 
     def _maybe_trim(self) -> None:
-        try:
-            if not self.path.exists():
-                return
-            lines = self.path.read_text(encoding="utf-8").splitlines()
-            if len(lines) <= self._MAX_LINES:
-                return
-            kept_lines: list[str] = []
-            for idx, line in enumerate(lines[-self._TRIM_TO:]):
-                item = self._parse_line(line, idx)
-                kept_lines.append(self._serialize_item(item) if item else line)
-            content = "\n".join(kept_lines)
-            tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-            tmp_path.write_text(content + "\n", encoding="utf-8")
-            tmp_path.replace(self.path)
-        except Exception:
-            pass
+        with self._lock:
+            try:
+                if not self.path.exists():
+                    return
+                lines = self.path.read_text(encoding="utf-8").splitlines()
+                if len(lines) <= self._MAX_LINES:
+                    return
+                kept_lines: list[str] = []
+                for idx, line in enumerate(lines[-self._TRIM_TO:]):
+                    item = self._parse_line(line, idx)
+                    kept_lines.append(self._serialize_item(item) if item else line)
+                content = "\n".join(kept_lines)
+                tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+                tmp_path.write_text(content + "\n", encoding="utf-8")
+                tmp_path.replace(self.path)
+            except Exception:
+                pass
 
     def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200) -> list[dict[str, Any]]:
-        if not self.path.exists():
-            return []
-        items: list[dict[str, Any]] = []
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        for line_number in range(len(lines) - 1, -1, -1):
-            item = self._parse_line(lines[line_number], line_number)
-            if item is None:
-                continue
-            if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
-                continue
-            items.append(item)
-            if len(items) >= limit:
-                break
-        return items
+        with self._lock:
+            if not self.path.exists():
+                return []
+            items: list[dict[str, Any]] = []
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+            for line_number in range(len(lines) - 1, -1, -1):
+                item = self._parse_line(lines[line_number], line_number)
+                if item is None:
+                    continue
+                if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
+                    continue
+                items.append(item)
+                if len(items) >= limit:
+                    break
+            return items
 
     def delete(self, ids: list[str]) -> dict[str, int]:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
-        if not self.path.exists() or not target_ids:
-            return {"removed": 0}
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        kept_lines: list[str] = []
-        removed = 0
-        for line_number, raw_line in enumerate(lines):
-            item = self._parse_line(raw_line, line_number)
-            if item is None:
-                kept_lines.append(raw_line)
-                continue
-            if str(item.get("id") or "") in target_ids:
-                removed += 1
-                continue
-            kept_lines.append(self._serialize_item(item))
-        content = "\n".join(kept_lines)
-        if content:
-            content += "\n"
-        self.path.write_text(content, encoding="utf-8")
-        return {"removed": removed}
+        with self._lock:
+            if not self.path.exists() or not target_ids:
+                return {"removed": 0}
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+            kept_lines: list[str] = []
+            removed = 0
+            for line_number, raw_line in enumerate(lines):
+                item = self._parse_line(raw_line, line_number)
+                if item is None:
+                    kept_lines.append(raw_line)
+                    continue
+                if str(item.get("id") or "") in target_ids:
+                    removed += 1
+                    continue
+                kept_lines.append(self._serialize_item(item))
+            content = "\n".join(kept_lines)
+            if content:
+                content += "\n"
+            self.path.write_text(content, encoding="utf-8")
+            return {"removed": removed}
 
 
 log_service = LogService(DATA_DIR / "logs.jsonl")

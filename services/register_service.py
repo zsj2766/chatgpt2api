@@ -153,7 +153,6 @@ class RegisterService:
                     elapsed = max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds())
                 except Exception:
                     elapsed = 0.0
-                done = int(stats.get("done") or 0)
                 success = int(stats.get("success") or 0)
                 fail = int(stats.get("fail") or 0)
                 stats["elapsed_seconds"] = round(elapsed, 1)
