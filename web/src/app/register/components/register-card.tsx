@@ -291,7 +291,7 @@ export function RegisterCard() {
                 {config.enabled ? "运行中" : "已停止"}
               </Badge>
             </div>
-            <div className="grid grid-cols-4 gap-2">
+            <div className="grid grid-cols-3 gap-2">
               {[
                 ["成功 / 成功率", `${stats.success} / ${stats.success_rate || 0}%`],
                 ["失败", stats.fail],
@@ -299,8 +299,6 @@ export function RegisterCard() {
                 ["运行 / 线程", `${stats.running} / ${stats.threads}`],
                 ["运行时间", `${stats.elapsed_seconds || 0}s`],
                 ["平均注册单个", `${stats.avg_seconds || 0}s`],
-                ["当前额度", stats.current_quota || 0],
-                ["正常账号", stats.current_available || 0],
               ].map(([label, value]) => (
                 <div key={label} className="border border-stone-200 bg-white/70 px-3 py-2">
                   <div className="text-xs text-stone-400">{label}</div>
