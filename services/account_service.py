@@ -1249,6 +1249,59 @@ class AccountService:
             return True
         return False
 
+    def _is_network_or_proxy_error(self, error_message: str) -> bool:
+        """判断是否为网络/代理错误（不应计入账号失效）。
+
+        网络错误通常是临时性的，不代表账号本身有问题。
+        """
+        if not error_message:
+            return False
+
+        error_lower = error_message.lower()
+
+        # 代理/连接错误关键词
+        network_keywords = [
+            'curl:',                      # curl 底层错误
+            'connect tunnel failed',      # 代理隧道失败
+            'connection refused',         # 连接被拒
+            'connection timeout',         # 连接超时
+            'timed out',                  # 超时
+            'response 429',               # 限流
+            'response 502',               # 网关错误
+            'response 503',               # 服务不可用
+            'ssl handshake',              # SSL 握手失败
+            'tls',                        # TLS 错误
+            'network unreachable',        # 网络不可达
+            'temporarily unavailable',    # 临时不可用
+            'proxy',                      # 代理相关错误
+        ]
+
+        return any(keyword in error_lower for keyword in network_keywords)
+
+    def _is_account_error(self, error_message: str) -> bool:
+        """判断是否为账号本身的错误（应该计入失效）。
+
+        账号错误通常是永久性的，需要重新登录或删除账号。
+        """
+        if not error_message:
+            return False
+
+        error_lower = error_message.lower()
+
+        # 明确的账号错误关键词
+        account_keywords = [
+            'refresh_token_invalidated',  # refresh_token 已失效
+            'token invalidated',          # token 失效
+            'session has ended',          # 会话结束
+            'invalid_request_error',      # 无效请求（通常是认证问题）
+            'account banned',             # 账号被封
+            'account suspended',          # 账号暂停
+            'unauthorized',               # 未授权
+            'authentication failed',      # 认证失败
+        ]
+
+        return any(keyword in error_lower for keyword in account_keywords)
+
     def _record_invalid_token_seen(
         self,
         access_token: str,
@@ -1256,6 +1309,30 @@ class AccountService:
         error: str,
         defer_invalid_removal: bool = True,
     ) -> bool:
+        error_str = str(error or "")
+
+        # 网络/代理错误：只记录日志，不计入 invalid_count，不删除账号
+        if self._is_network_or_proxy_error(error_str):
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "网络错误（不计入账号失效）",
+                {"source": event, "token": anonymize_token(access_token), "error": error_str},
+            )
+            # 仍然更新 last_refresh_error，便于排查，但不计入 invalid_count
+            with self._lock:
+                access_token = self._resolve_access_token_locked(access_token)
+                current = self._accounts.get(access_token)
+                if current is not None:
+                    next_item = dict(current)
+                    next_item["last_refresh_error"] = error_str
+                    next_item["last_refresh_error_at"] = datetime.now(timezone.utc).isoformat()
+                    account = self._normalize_account(next_item)
+                    if account is not None:
+                        self._accounts[access_token] = account
+                        self._save_accounts()
+            return False  # 不删除
+
+        # 账号错误：正常处理（计入 invalid_count）
         now = datetime.now(timezone.utc)
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
@@ -1266,7 +1343,7 @@ class AccountService:
             next_item = dict(current)
             next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
             next_item["last_invalid_at"] = now.isoformat()
-            next_item["last_refresh_error"] = str(error or "invalid access token")
+            next_item["last_refresh_error"] = error_str
             next_item["last_refresh_error_at"] = now.isoformat()
             account = self._normalize_account(next_item)
             if account is not None:
@@ -1276,7 +1353,7 @@ class AccountService:
                 log_service.add(
                     LOG_TYPE_ACCOUNT,
                     "暂缓标记异常账号",
-                    {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
+                    {"source": event, "token": anonymize_token(access_token), "error": error_str},
                 )
                 return False
         return True
