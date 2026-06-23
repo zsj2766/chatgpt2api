@@ -128,6 +128,9 @@ export function SystemStatusCard() {
             <StatBox label="过期" value={accounts.expired} color="text-stone-500" />
             <StatBox label="禁用" value={accounts.disabled} color="text-stone-400" />
           </div>
+          <div className="grid grid-cols-1 gap-2">
+            <StatBox label="剩余额度" value={accounts.total_quota} color="text-blue-600" />
+          </div>
         </div>
 
         {/* 注册任务状态 */}
