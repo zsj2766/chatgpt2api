@@ -10,7 +10,6 @@ import { getStoredAuthKey } from "@/store/auth";
 
 import { useSettingsStore } from "../settings/store";
 import { RegisterCard } from "./components/register-card";
-import { SystemStatusCard } from "./components/system-status-card";
 
 function RegisterDataController() {
   const didLoadRef = useRef(false);
@@ -52,9 +51,6 @@ function RegisterPageContent() {
           <div className="text-xs font-semibold tracking-[0.18em] text-stone-500 uppercase">Register</div>
           <h1 className="text-2xl font-semibold tracking-tight">ChatGPT注册机</h1>
         </div>
-      </section>
-      <section className="mb-2">
-        <SystemStatusCard />
       </section>
       <section>
         <RegisterCard />

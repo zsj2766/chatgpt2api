@@ -23,7 +23,10 @@ def create_app() -> FastAPI:
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
-        backup_service.start()
+        # 只在配置启用时启动备份调度线程
+        backup_settings = config.get_backup_settings()
+        if backup_settings.get("enabled"):
+            backup_service.start()
         config.cleanup_old_images()
         try:
             yield

@@ -13,6 +13,12 @@ const THREAD_LABEL: Record<string, string> = {
   "r2-backup-scheduler": "备份调度",
 };
 
+const MODE_LABEL: Record<string, string> = {
+  "total": "注册总数",
+  "quota": "剩余额度",
+  "available": "可用账号数",
+};
+
 function formatInterval(seconds: number): string {
   if (seconds >= 3600) return `${Math.round(seconds / 3600)}h`;
   if (seconds >= 60) return `${Math.round(seconds / 60)}min`;
@@ -102,7 +108,11 @@ export function SystemStatusCard() {
               <AutomationBadge label="移除异常账号" enabled={automation.auto_remove_invalid_accounts} />
               <AutomationBadge label="移除限流账号" enabled={automation.auto_remove_rate_limited_accounts} />
               <AutomationBadge label="刷新后重登录" enabled={automation.auto_relogin_after_refresh} />
-              <AutomationBadge label={`图片自动清理 (${automation.image_retention_days}天)`} enabled={true} />
+              <div className="flex items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 py-1.5">
+                <Activity className="size-3.5 text-emerald-500" />
+                <span className="text-xs text-stone-700">图片自动清理</span>
+                <span className="ml-auto text-xs font-medium text-stone-600">{automation.image_retention_days}天</span>
+              </div>
             </div>
           </div>
         </div>
@@ -118,7 +128,6 @@ export function SystemStatusCard() {
             <StatBox label="过期" value={accounts.expired} color="text-stone-500" />
             <StatBox label="禁用" value={accounts.disabled} color="text-stone-400" />
           </div>
-          <div className="text-xs text-stone-500">正常账号剩余额度合计：<span className="font-semibold text-stone-700">{accounts.total_quota}</span></div>
         </div>
 
         {/* 注册任务状态 */}
@@ -127,7 +136,7 @@ export function SystemStatusCard() {
           <div className="flex items-center gap-2 rounded-lg border border-stone-200 bg-stone-50 px-3 py-2">
             {register.enabled ? <Play className="size-4 text-emerald-500" /> : <Pause className="size-4 text-stone-400" />}
             <span className="text-xs font-medium text-stone-700">{register.enabled ? "运行中" : "未启动"}</span>
-            <span className="text-xs text-stone-400">模式：{register.mode || "-"}</span>
+            <span className="text-xs text-stone-400">模式：{MODE_LABEL[register.mode] || register.mode || "-"}</span>
             <div className="ml-auto flex gap-3 text-xs">
               <span className="text-emerald-600">成功 {register.success}</span>
               <span className="text-rose-600">失败 {register.fail}</span>
