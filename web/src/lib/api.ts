@@ -195,7 +195,6 @@ export type BackupInclude = {
   register: boolean;
   cpa: boolean;
   sub2api: boolean;
-  logs: boolean;
   image_tasks: boolean;
   accounts_snapshot: boolean;
   auth_keys_snapshot: boolean;
@@ -267,15 +266,6 @@ export type ManagedImage = {
   width?: number;
   height?: number;
   tags?: string[];
-};
-
-export type SystemLog = {
-  id: string;
-  time: string;
-  type: "call" | "account" | "register" | string;
-  summary?: string;
-  detail?: Record<string, unknown>;
-  [key: string]: unknown;
 };
 
 export type ImageResponse = {
@@ -729,20 +719,6 @@ export async function deleteToTarget(targetFreeMb: number) {
   );
 }
 
-export async function fetchSystemLogs(filters: { type?: string; start_date?: string; end_date?: string }) {
-  const params = new URLSearchParams();
-  if (filters.type) params.set("type", filters.type);
-  if (filters.start_date) params.set("start_date", filters.start_date);
-  if (filters.end_date) params.set("end_date", filters.end_date);
-  return httpRequest<{ items: SystemLog[] }>(`/api/logs${params.toString() ? `?${params.toString()}` : ""}`);
-}
-
-export async function deleteSystemLogs(ids: string[]) {
-  return httpRequest<{ removed: number }>("/api/logs/delete", {
-    method: "POST",
-    body: { ids },
-  });
-}
 
 export async function fetchUserKeys() {
   return httpRequest<{ items: UserKey[] }>("/api/auth/users");
@@ -789,6 +765,45 @@ export async function stopRegister() {
 
 export async function resetRegister() {
   return httpRequest<{ register: RegisterConfig }>("/api/register/reset", { method: "POST" });
+}
+
+export type RegisterThreadStatus = {
+  name: string;
+  alive: boolean;
+  interval_seconds: number;
+  last_run_at: string;
+  message: string;
+  idle_seconds: number;
+};
+
+export type RegisterSystemStatus = {
+  threads: RegisterThreadStatus[];
+  accounts: {
+    total: number;
+    normal: number;
+    limited: number;
+    abnormal: number;
+    expired: number;
+    disabled: number;
+    total_quota: number;
+  };
+  register: {
+    enabled: boolean;
+    mode: string;
+    success: number;
+    fail: number;
+    running: number;
+  };
+  automation: {
+    auto_remove_invalid_accounts: boolean;
+    auto_remove_rate_limited_accounts: boolean;
+    auto_relogin_after_refresh: boolean;
+    image_retention_days: number;
+  };
+};
+
+export async function fetchRegisterSystemStatus() {
+  return httpRequest<RegisterSystemStatus>("/api/register/system-status");
 }
 
 // ── CPA (CLIProxyAPI) ──────────────────────────────────────────────

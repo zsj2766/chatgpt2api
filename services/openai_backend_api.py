@@ -201,6 +201,21 @@ class OpenAIBackendAPI:
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
 
+    def close(self) -> None:
+        """释放底层 curl_cffi session（TLS 上下文/连接句柄）。"""
+        session = getattr(self, "session", None)
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
     def _build_fp(self) -> Dict[str, str]:
         account = self.account
         raw_fp = account.get("fp")

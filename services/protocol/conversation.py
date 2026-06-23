@@ -1263,6 +1263,7 @@ def _generate_single_image(
             "account_found": bool(account),
             "index": index,
         })
+        backend = None
         try:
             backend = OpenAIBackendAPI(access_token=token)
             if request.progress_callback:
@@ -1436,6 +1437,10 @@ def _generate_single_image(
                     time.sleep(wait_secs)
                     continue
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
+        finally:
+            # 释放底层 curl_cffi session，防重试换账号时 TLS 上下文/句柄泄漏
+            if backend is not None:
+                backend.close()
 
 
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
@@ -1468,11 +1473,14 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         "n": request.n,
         "model": request.model,
     })
-    # 每张图片一个线程，同时启动
+    # 全局线程上限：image_account_concurrency 只限每账号在途数，不限总线程。
+    # 用 max_workers 封顶，防 request.n 过大时线程/CPU/内存无界扩张。
+    max_total = config.image_max_total_concurrency
+    workers = min(request.n, max_total)
     futures = {}
     results: dict[int, list[ImageOutput]] = {}
     errors: dict[int, Exception] = {}
-    with ThreadPoolExecutor(max_workers=request.n) as executor:
+    with ThreadPoolExecutor(max_workers=workers) as executor:
         for index in range(1, request.n + 1):
             future = executor.submit(_generate_single_image, request, index, request.n)
             futures[future] = index

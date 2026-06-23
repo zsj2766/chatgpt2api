@@ -18,6 +18,7 @@ from curl_cffi import requests
 from services.config import BASE_DIR, CONFIG_FILE, DATA_DIR, config, load_backup_state, save_backup_state
 from services.image_storage_service import IMAGE_INDEX_FILE
 from services.image_tags_service import TAGS_FILE
+from services.thread_status import thread_status
 
 
 def _utc_now() -> datetime:
@@ -314,6 +315,7 @@ class BackupService:
             self._stop_event.clear()
             self._thread = threading.Thread(target=self._run, daemon=True, name="r2-backup-scheduler")
             self._thread.start()
+        thread_status.register("r2-backup-scheduler", 30)
 
     def stop(self) -> None:
         with self._lock:
@@ -327,6 +329,7 @@ class BackupService:
         while not self._stop_event.is_set():
             try:
                 self.run_scheduled_backup_if_needed()
+                thread_status.heartbeat("r2-backup-scheduler", "调度检查")
             except Exception:
                 pass
             self._stop_event.wait(30)
@@ -628,8 +631,6 @@ class BackupService:
                 self._add_file_to_archive(archive, DATA_DIR / "cpa_config.json", "data/cpa_config.json")
             if include.get("sub2api"):
                 self._add_file_to_archive(archive, DATA_DIR / "sub2api_config.json", "data/sub2api_config.json")
-            if include.get("logs"):
-                self._add_file_to_archive(archive, DATA_DIR / "logs.jsonl", "data/logs.jsonl")
             if include.get("image_tasks"):
                 self._add_file_to_archive(archive, DATA_DIR / "image_tasks.json", "data/image_tasks.json")
                 self._add_file_to_archive(archive, IMAGE_INDEX_FILE, "data/image_index.json")

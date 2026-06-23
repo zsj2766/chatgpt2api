@@ -14,6 +14,7 @@ from PIL import Image, ImageOps
 from services.config import config
 from services.image_storage_service import image_storage_service
 from services.image_tags_service import load_tags, remove_tags
+from services.thread_status import thread_status
 from utils.log import logger
 
 THUMBNAIL_SIZE = (320, 320)
@@ -355,6 +356,7 @@ def _auto_cleanup_worker(stop_event: threading.Event) -> None:
     min_free_mb = getattr(config, "image_min_free_mb", None)
     if min_free_mb is None:
         min_free_mb = 500
+    thread_status.register("image-cleanup", 1800)
 
     while not stop_event.wait(1800):  # 每30分钟
         try:
@@ -366,6 +368,7 @@ def _auto_cleanup_worker(stop_event: threading.Event) -> None:
                 logger.info({"event": "image_auto_cleanup", "free_mb": free_mb, "min_free_mb": min_free_mb})
                 result = delete_to_target(min_free_mb)
                 logger.info({"event": "image_auto_cleanup_done", **result})
+            thread_status.heartbeat("image-cleanup", f"剩余 {free_mb}MB")
         except Exception:
             pass
 

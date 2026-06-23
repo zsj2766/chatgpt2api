@@ -21,7 +21,6 @@ DEFAULT_BACKUP_INCLUDE = {
     "register": True,
     "cpa": True,
     "sub2api": True,
-    "logs": True,
     "image_tasks": True,
     "accounts_snapshot": True,
     "auth_keys_snapshot": True,
@@ -438,6 +437,15 @@ class ConfigStore:
             return 3
 
     @property
+    def image_max_total_concurrency(self) -> int:
+        """并发生图全局线程上限：image_account_concurrency 只限每账号在途数，
+        此项限总线程，防 request.n 过大时线程/CPU/内存无界扩张。"""
+        try:
+            return max(1, int(self.data.get("image_max_total_concurrency", 8)))
+        except (TypeError, ValueError):
+            return 8
+
+    @property
     def image_parallel_generation(self) -> bool:
         value = self.data.get("image_parallel_generation", True)
         if isinstance(value, str):
@@ -563,6 +571,7 @@ class ConfigStore:
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency
+        data["image_max_total_concurrency"] = self.image_max_total_concurrency
         data["image_parallel_generation"] = self.image_parallel_generation
         data["image_settle_enabled"] = self.image_settle_enabled
         data["image_check_before_hit_enabled"] = self.image_check_before_hit_enabled

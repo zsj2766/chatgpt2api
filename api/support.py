@@ -8,6 +8,7 @@ from fastapi import HTTPException, Request
 from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config
+from services.thread_status import thread_status
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
@@ -82,6 +83,7 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
 def start_limited_account_watcher(stop_event: Event) -> Thread:
     # 下限 60s：配置为 0 会使 wait(0) 立即返回 → 忙等待 CPU 100%
     interval_seconds = max(60, config.refresh_account_interval_minute * 60)
+    thread_status.register("account-watcher", interval_seconds)
 
     def worker() -> None:
         while not stop_event.is_set():
@@ -93,6 +95,10 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                 tokens = list(dict.fromkeys([*limited_tokens, *normal_tokens, *expiring_tokens]))
                 expiring_token_set = set(expiring_tokens)
                 keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
+                thread_status.heartbeat(
+                    "account-watcher",
+                    f"刷新 {len(tokens)} 个账号" if tokens else "空闲",
+                )
                 if tokens:
                     print(
                         "[account-watcher] checking "

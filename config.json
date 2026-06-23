@@ -61,7 +61,6 @@
       "register": true,
       "cpa": true,
       "sub2api": true,
-      "logs": true,
       "image_tasks": true,
       "accounts_snapshot": true,
       "auth_keys_snapshot": true,
@@ -69,10 +68,10 @@
     }
   },
   "image_account_concurrency": 3,
+  "image_max_total_concurrency": 8,
   "image_parallel_generation": true,
   "image_poll_interval_secs": 10,
   "image_poll_initial_wait_secs": 10,
-  "image_parallel_generation": true,
   "image_settle_enabled": true,
   "image_check_before_hit_enabled": true,
   "image_settle_secs": 2.0,
@@ -96,9 +95,6 @@
     "drop_adjacent_duplicates": true,
     "drop_assistant_history": false
   },
-  "image_settle_enabled": false,
-  "image_check_before_hit_enabled": false,
-  "image_settle_secs": 2,
   "auto_relogin_after_refresh": false,
   "image_timeout_retry_secs": 30,
   "third_party_apps": {

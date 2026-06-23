@@ -1662,6 +1662,7 @@ class AccountService:
         active = sum(1 for a in items if a.get("status") == "正常")
         limited = sum(1 for a in items if a.get("status") == "限流")
         abnormal = sum(1 for a in items if a.get("status") == "异常")
+        expired = sum(1 for a in items if a.get("status") == "过期")
         disabled = sum(1 for a in items if a.get("status") == "禁用")
         total_quota = sum(max(0, int(a.get("quota") or 0)) for a in items if a.get("status") == "正常")
         unlimited = sum(1 for a in items if a.get("status") == "正常" and bool(a.get("image_quota_unknown")))
@@ -1677,6 +1678,7 @@ class AccountService:
             "active": active,
             "limited": limited,
             "abnormal": abnormal,
+            "expired": expired,
             "disabled": disabled,
             "total_quota": total_quota,
             "unlimited_quota_count": unlimited,

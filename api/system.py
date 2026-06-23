@@ -23,7 +23,6 @@ from services.image_service import (
 )
 from services.image_storage_service import ImageStorageError, image_storage_service
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
-from services.log_service import log_service
 from services.proxy_service import proxy_settings, test_clearance, test_proxy
 
 
@@ -52,8 +51,6 @@ class ImageTagsRequest(BaseModel):
     path: str
     tags: list[str]
 
-class LogDeleteRequest(BaseModel):
-    ids: list[str] = []
 class BackupDeleteRequest(BaseModel):
     key: str = ""
 
@@ -126,16 +123,6 @@ def create_router(app_version: str) -> APIRouter:
     async def download_single_image_endpoint(image_path: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return get_image_download_response(image_path)
-
-    @router.get("/api/logs")
-    async def get_logs(type: str = "", start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"items": log_service.list(type=type.strip(), start_date=start_date.strip(), end_date=end_date.strip())}
-
-    @router.post("/api/logs/delete")
-    async def delete_logs(body: LogDeleteRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return log_service.delete(body.ids)
 
     @router.post("/api/proxy/test")
     async def test_proxy_endpoint(body: ProxyTestRequest, authorization: str | None = Header(default=None)):

@@ -65,6 +65,7 @@ import { useAuthGuard } from "@/lib/use-auth-guard";
 import { cn } from "@/lib/utils";
 
 import { AccountImportDialog } from "./components/account-import-dialog";
+import { SystemStatusCard } from "../register/components/system-status-card";
 
 const accountStatusOptions: { label: string; value: AccountStatus | "all" }[] = [
   { label: "全部状态", value: "all" },
@@ -870,6 +871,9 @@ function AccountsPageContent() {
           </Button>
         </div>
       </section>
+
+      {/* 系统状态监控卡片 */}
+      <SystemStatusCard />
 
       {/* 进度条 */}
       {progress.visible && (

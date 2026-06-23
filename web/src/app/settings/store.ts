@@ -117,8 +117,8 @@ function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
 function normalizeThirdPartyApps(value: unknown): ThirdPartyAppsSettings {
   const source = typeof value === "object" && value !== null ? value as Partial<ThirdPartyAppsSettings> : {};
   const canvas = typeof source.infinite_canvas === "object" && source.infinite_canvas
-    ? source.infinite_canvas
-    : {};
+    ? source.infinite_canvas as ThirdPartyAppsSettings["infinite_canvas"]
+    : DEFAULT_THIRD_PARTY_APPS.infinite_canvas;
   return {
     infinite_canvas: {
       enabled: Boolean(canvas.enabled),
@@ -163,7 +163,6 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
         register: true,
         cpa: true,
         sub2api: true,
-        logs: true,
         image_tasks: true,
         accounts_snapshot: true,
         auth_keys_snapshot: true,
@@ -223,7 +222,6 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
         register: Boolean(backup.include?.register ?? true),
         cpa: Boolean(backup.include?.cpa ?? true),
         sub2api: Boolean(backup.include?.sub2api ?? true),
-        logs: Boolean(backup.include?.logs ?? true),
         image_tasks: Boolean(backup.include?.image_tasks ?? true),
         accounts_snapshot: Boolean(backup.include?.accounts_snapshot ?? true),
         auth_keys_snapshot: Boolean(backup.include?.auth_keys_snapshot ?? true),
