@@ -1,14 +1,47 @@
+# Git
 .git
 .gitignore
+.github
+
+# IDE
 .idea
+.vscode
+.codex
+
+# Python
 .venv
 __pycache__
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache
 
+# Web
 web/.next
 web/node_modules
+web/tsconfig.tsbuildinfo
 
-assets
+# Documentation (KEEP: CHANGELOG.md, VERSION are used in build)
 README.md
+CLAUDE.md
+UPGRADE.md
+AUDIT_REPORT.md
+
+# Tests
+tests/
+*.test.py
+
+# Data (runtime generated, not needed in image)
+data/
+*.db
+*.log
+*.jsonl
+
+# Development files
+assets
+start.bat
+
+# Temporary files
+*.tmp
+*.bak
+.DS_Store
