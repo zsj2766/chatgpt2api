@@ -20,7 +20,6 @@ import {
   RefreshCw,
   Search,
   Trash2,
-  UserRound,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -90,29 +89,12 @@ const statusMeta: Record<
   过期: { icon: Clock, badge: "outline" },
 };
 
-const metricCards = [
-  { key: "total", label: "账户总数", color: "text-stone-900", icon: UserRound },
-  { key: "active", label: "正常账户", color: "text-emerald-600", icon: CheckCircle2 },
-  { key: "limited", label: "限流账户", color: "text-orange-500", icon: CircleAlert },
-  { key: "abnormal", label: "异常账户", color: "text-rose-500", icon: CircleOff },
-  { key: "expired", label: "过期账户", color: "text-stone-400", icon: Clock },
-  { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
-  { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
-] as const;
-
 function isUnlimitedImageQuotaAccount(account: Account) {
   return account.type === "pro" || account.type === "prolite";
 }
 
 function imageQuotaUnknown(account: Account) {
   return Boolean(account.image_quota_unknown);
-}
-
-function formatCompact(value: number) {
-  if (value >= 1000) {
-    return `${(value / 1000).toFixed(1)}k`;
-  }
-  return String(value);
 }
 
 function formatQuota(account: Account) {
@@ -147,17 +129,6 @@ function formatRestoreAt(value?: string | null) {
   )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 
   return { absolute, relative };
-}
-
-function formatQuotaSummary(accounts: Account[]) {
-  const availableAccounts = accounts.filter((account) => account.status === "正常");
-  if (availableAccounts.some(isUnlimitedImageQuotaAccount)) {
-    return "∞";
-  }
-  if (availableAccounts.some(imageQuotaUnknown)) {
-    return "未知";
-  }
-  return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
 }
 
 function maskToken(token?: string) {
@@ -264,7 +235,6 @@ function AccountsPageContent() {
     email: "",
   });
   const progressRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const [refreshSummary, setRefreshSummary] = useState<Record<string, number | string> | null>(null);
 
   const loadAccounts = async (silent = false) => {
     if (!silent) {
@@ -328,18 +298,6 @@ function AccountsPageContent() {
   const currentRows = filteredAccounts.slice(startIndex, startIndex + Number(pageSize));
   const allCurrentSelected =
     currentRows.length > 0 && currentRows.every((row) => selectedIds.includes(row.access_token));
-
-  const summary = useMemo(() => {
-    const total = accounts.length;
-    const active = accounts.filter((item) => item.status === "正常").length;
-    const limited = accounts.filter((item) => item.status === "限流").length;
-    const abnormal = accounts.filter((item) => item.status === "异常").length;
-    const expired = accounts.filter((item) => item.status === "过期").length;
-    const disabled = accounts.filter((item) => item.status === "禁用").length;
-    const quota = formatQuotaSummary(accounts);
-
-    return { total, active, limited, abnormal, expired, disabled, quota };
-  }, [accounts]);
 
   const accountTypeOptions = useMemo(
     () => [
@@ -424,19 +382,6 @@ function AccountsPageContent() {
 
     setIsRefreshing(true);
 
-    // 计算非选中账号的基数（统计卡片联动用）
-    const selectedTokenSet = new Set(accessTokens);
-    const baseAccountsList = accounts.filter((a) => !selectedTokenSet.has(a.access_token));
-    const baseActive = baseAccountsList.filter((a) => a.status === "正常").length;
-    const baseLimited = baseAccountsList.filter((a) => a.status === "限流").length;
-    const baseAbnormal = baseAccountsList.filter((a) => a.status === "异常").length;
-    const baseDisabled = baseAccountsList.filter((a) => a.status === "禁用").length;
-    const baseNormalAccounts = baseAccountsList.filter((a) => a.status === "正常");
-    const baseHasUnlimited = baseNormalAccounts.some(isUnlimitedImageQuotaAccount);
-    const baseHasUnknown = baseNormalAccounts.some(imageQuotaUnknown);
-    const baseQuotaNum = baseNormalAccounts.reduce((s, a) => s + Math.max(0, a.quota), 0);
-
-    // 显示进度条（只显示当前任务，不含分类统计）
     const total = accessTokens.length;
     setProgress({
       visible: true,
@@ -470,36 +415,12 @@ function AccountsPageContent() {
                 current: prev.total,
                 message: "刷新完成",
               }));
-              // 清除联动统计
-              setRefreshSummary(null);
               resolve(p.result);
             } else {
-              // 实时更新进度
               setProgress((prev) => ({
                 ...prev,
                 current: p.processed,
               }));
-              // 实时更新统计卡片：基数 + 已刷新的累加结果
-              const runningActive = baseActive + ((p.status_counts?.["正常"]) ?? 0);
-              const runningLimited = baseLimited + ((p.status_counts?.["限流"]) ?? 0);
-              const runningAbnormal = baseAbnormal + ((p.status_counts?.["异常"]) ?? 0);
-              const runningDisabled = baseDisabled + ((p.status_counts?.["禁用"]) ?? 0);
-              let runningQuota: string | number;
-              if (baseHasUnlimited) {
-                runningQuota = "∞";
-              } else if (baseHasUnknown) {
-                runningQuota = "未知";
-              } else {
-                runningQuota = formatCompact(baseQuotaNum + (p.total_quota ?? 0));
-              }
-              setRefreshSummary({
-                total: accounts.length,
-                active: runningActive,
-                limited: runningLimited,
-                abnormal: runningAbnormal,
-                disabled: runningDisabled,
-                quota: runningQuota,
-              });
             }
           } catch (err) {
             clearInterval(pollTimer);
@@ -566,7 +487,6 @@ function AccountsPageContent() {
       }
     } catch (error) {
       setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
-      setRefreshSummary(null);
       const message = error instanceof Error ? error.message : "刷新账户失败";
       toast.error(message);
     } finally {
@@ -622,15 +542,6 @@ function AccountsPageContent() {
 
     setIsRelogining(true);
 
-    // 计算非选中账号的基数（统计卡片联动用）
-    const selectedTokenSet = new Set(abnormalTokens);
-    const baseAccountsList = accounts.filter((a) => !selectedTokenSet.has(a.access_token));
-    const baseActive = baseAccountsList.filter((a) => a.status === "正常").length;
-    const baseLimited = baseAccountsList.filter((a) => a.status === "限流").length;
-    const baseAbnormal = baseAccountsList.filter((a) => a.status === "异常").length;
-    const baseDisabled = baseAccountsList.filter((a) => a.status === "禁用").length;
-
-    // 显示进度条（真实进度）
     const total = abnormalTokens.length;
     setProgress({ visible: true, current: 0, total, message: "正在尝试恢复异常账号...", email: "" });
 
@@ -649,12 +560,9 @@ function AccountsPageContent() {
                 return;
               }
               setProgress((prev) => ({ ...prev, current: prev.total, message: "恢复流程已完成" }));
-              setRefreshSummary(null);
               resolve();
             } else {
-              // 实时更新进度
               const results = p.results ?? [];
-              // 找到最新一条有错误的结果
               const lastErrorResult = [...results].reverse().find((r) => r.error);
               const emailHint = lastErrorResult
                 ? `失败: ${lastErrorResult.token} ${lastErrorResult.error ?? ""}`
@@ -665,29 +573,6 @@ function AccountsPageContent() {
                 email: emailHint,
                 message: "正在尝试恢复异常账号...",
               }));
-
-              // 实时更新统计卡片：基数 + 已处理的恢复结果
-              let runningActive = baseActive;
-              let runningAbnormal = baseAbnormal;
-              let runningDisabled = baseDisabled;
-              for (const r of results) {
-                if (r.status === "成功") {
-                  runningActive += 1;
-                  runningAbnormal -= 1;
-                } else if (r.status === "禁用") {
-                  runningDisabled += 1;
-                  runningAbnormal -= 1;
-                }
-                // "异常"或"跳过"：保持异常状态不变
-              }
-              setRefreshSummary({
-                total: accounts.length,
-                active: runningActive,
-                limited: baseLimited,
-                abnormal: runningAbnormal,
-                disabled: runningDisabled,
-                quota: summary.quota,
-              });
             }
           } catch (err) {
             clearInterval(pollTimer);
@@ -716,7 +601,6 @@ function AccountsPageContent() {
       toast.success(`恢复流程已全部完成`);
     } catch (error) {
       setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
-      setRefreshSummary(null);
       const message = error instanceof Error ? error.message : "重新登录失败";
       toast.error(message);
     } finally {
@@ -1027,27 +911,6 @@ function AccountsPageContent() {
       </Dialog>
 
       <section className="space-y-3">
-        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
-          {metricCards.map((item) => {
-            const Icon = item.icon;
-            const value = (refreshSummary ?? summary)[item.key];
-            return (
-              <Card key={item.key} className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
-                <CardContent className="p-4">
-                  <div className="mb-4 flex items-start justify-between">
-                    <span className="text-xs font-medium text-stone-400">{item.label}</span>
-                    <Icon className="size-4 text-stone-400" />
-                  </div>
-                  <div className={cn("text-[1.75rem] font-semibold tracking-tight", item.color)}>
-                    <span className={typeof value === "number" ? "" : "text-[1.1rem]"}>
-                      {typeof value === "number" ? formatCompact(value) : value}
-                    </span>
-                  </div>
-                </CardContent>
-              </Card>
-            );
-          })}
-        </div>
         <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
           <CardContent className="p-4">
             <div className="mb-3 text-sm font-medium text-stone-700">
